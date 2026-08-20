@@ -25,18 +25,18 @@ export function apply(ctx: ClientContext): void {
   for (const controller of controllers.values()) controller.refreshIfLoaded()
  })
 
- ctx.slots.register({
-  name: 'conversation.view',
-  id: 'message-edit-timeline',
-  order: MESSAGE_EDIT_VIEW_ORDER,
-  label: 'Timeline',
-  inject: (sessionId: SessionId) => controllerFor(sessionId).face,
- }, MessageEditTimelineView)
+  ctx.slots.register({
+    name: 'conversation.view',
+    id: 'message-edit-enhanced-timeline',
+    order: MESSAGE_EDIT_VIEW_ORDER,
+    label: 'Timeline',
+    inject: (sessionId: SessionId) => controllerFor(sessionId).face,
+  }, MessageEditTimelineView)
 
- ctx.slots.register({
-  name: 'conversation.session.header.actions',
-  id: 'message-edit-controls',
-  order: MESSAGE_EDIT_VIEW_ORDER,
-  inject: (sessionId: SessionId) => controllerFor(sessionId).face,
- }, MessageEditHeader)
+  ctx.slots.register({
+    name: 'conversation.session.header.actions',
+    id: 'message-edit-enhanced-controls',
+    order: MESSAGE_EDIT_VIEW_ORDER,
+    inject: (sessionId: SessionId) => controllerFor(sessionId).face,
+  }, MessageEditHeader)
 }

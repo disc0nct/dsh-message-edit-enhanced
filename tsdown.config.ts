@@ -1,6 +1,6 @@
 import { clientBundle } from './scripts/dsh-client-preset.ts'
 
-const PLUGIN_ID = 'dsh-message-edit'
+const PLUGIN_ID = 'dsh-message-edit-enhanced'
 const clientConfig = clientBundle(PLUGIN_ID)
 
 export default () => [

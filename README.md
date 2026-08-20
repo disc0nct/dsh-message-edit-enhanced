@@ -1,10 +1,10 @@
-# DSH Message Edit
+# DSH Message Edit Enhanced
 
-[![npm version](https://img.shields.io/npm/v/dsh-message-edit)](https://www.npmjs.com/package/dsh-message-edit)
-[![npm downloads](https://img.shields.io/npm/dm/dsh-message-edit)](https://www.npmjs.com/package/dsh-message-edit)
-[![license](https://img.shields.io/npm/l/dsh-message-edit)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/dsh-message-edit-enhanced)](https://www.npmjs.com/package/dsh-message-edit-enhanced)
+[![npm downloads](https://img.shields.io/npm/dm/dsh-message-edit-enhanced)](https://www.npmjs.com/package/dsh-message-edit-enhanced)
+[![license](https://img.shields.io/npm/l/dsh-message-edit-enhanced)](LICENSE)
 
-`dsh-message-edit` ([npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
+`dsh-message-edit-enhanced` ([npm](https://www.npmjs.com/package/dsh-message-edit-enhanced) · [GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
 
 ```bash
 dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhanced
@@ -29,7 +29,7 @@ The plugin treats a **complete turn** as the atomic effect. The target turn's `t
 
 1. User message edit, Reroll, and Retry: roll back the entire target turn, then submit the target user input as a new turn to the Agent.
 2. Assistant block edit: roll back the entire target turn, construct a new fully closed turn from the original user input plus the edited assistant content; the original tool chain does not carry into the new version. When `preserve` is selected, subsequent user inputs are then submitted to the Agent sequentially, producing a new complete tool chain.
-3. Each version appends an indivisible `message-edit/version` effect pair: `effect` records the forward effect, `inverse` records the restore target. The parent version chain automatically derives the combined inverse; restoration does not delete events but switches to another existing version along the inverse chain.
+3. Each version appends an indivisible `message-edit-enhanced/version` effect pair: `effect` records the forward effect, `inverse` records the restore target. The parent version chain automatically derives the combined inverse; restoration does not delete events but switches to another existing version along the inverse chain.
 4. Message history transforms do not commute, so undo follows LIFO: only the current atomic effect is undone while keeping earlier effects; all successor branches remain and can be re-applied from the parent version.
 
 ### Branching and Agent Wiring
@@ -52,7 +52,7 @@ This path does not touch `ReactLoopAgent`, AgentLoop private methods, or apiprox
 
 ## Data Model
 
-Each plugin version contains a `message-edit/version` event in its own non-inherited suffix:
+Each plugin version contains a `message-edit-enhanced/version` event in its own non-inherited suffix:
 
 ```ts
 interface MessageEditVersionEvent {
@@ -80,12 +80,12 @@ The session header's `parentSession` forms the version tree and must match `inve
 ## UI
 
 - `conversation.view`
- - `id: message-edit-timeline`
- - `order: 15`
- - `label: Timeline`
+  - `id: message-edit-enhanced-timeline`
+  - `order: 15`
+  - `label: Timeline`
 - `conversation.session.header.actions`
- - `id: message-edit-controls`
- - Direct parent effect undo, direct child effect redo, effect chain count, last reply regenerate
+  - `id: message-edit-enhanced-controls`
+  - Direct parent effect undo, direct child effect redo, effect chain count, last reply regenerate
 
 Components use CSS Modules and `--dsw-*` semantic tokens without adding a UI library. All product copy is in English and code comments are in English.
 
@@ -111,15 +111,15 @@ dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhance
 Or for local development:
 
 ```bash
-dsh plugin --profile web add -w link:/path/to/dsh-message-edit
+dsh plugin --profile web add -w link:/path/to/dsh-message-edit-enhanced
 ```
 
 `dsh plugin` is a pnpm forwarder: after `add` it automatically detects the `dsh.bundle` declaration and enrolls the plugin into the profile's `dsh.profile.bundles`; restart dsh to take effect. For local development, `link:` (symlink) is recommended; rebuilding after source changes and restarting will pick up updates.
 
 ## HTTP API
 
-- `GET /message-edit?sessionId=<id>`: Read editable messages, retryable turns, and the complete version tree.
-- `POST /message-edit`: Execute `edit`, `reroll`, or `retry` and return the newly published Session ID.
+- `GET /message-edit-enhanced?sessionId=<id>`: Read editable messages, retryable turns, and the complete version tree.
+- `POST /message-edit-enhanced`: Execute `edit`, `reroll`, or `retry` and return the newly published Session ID.
 
 ## Scope Boundaries
 

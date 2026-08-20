@@ -1,6 +1,6 @@
 {
- "name": "dsh-message-edit",
- "description": "Branch-based editing, rerolling, retrying, and version navigation for DeepSeek Harness conversations",
+  "name": "dsh-message-edit-enhanced",
+  "description": "Branch-based editing, rerolling, retrying, and version navigation for DeepSeek Harness conversations",
  "version": "0.2.3",
  "type": "module",
  "main": "./index.mjs",
@@ -34,17 +34,17 @@
   "build": "node ./scripts/build.mjs",
   "prepublishOnly": "npm run build"
  },
- "repository": {
-  "type": "git",
-  "url": "git+https://github.com/Moeblack/dsh-message-edit.git"
- },
- "keywords": [
-  "deepseek-harness",
-  "dsh",
-  "plugin",
-  "message-edit",
-  "reroll"
- ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/disc0nct/dsh-message-edit-enhanced.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "message-edit-enhanced",
+    "reroll"
+  ],
  "license": "MIT",
  "devDependencies": {
   "@deepseek-ai/cordis": "^4.0.1",

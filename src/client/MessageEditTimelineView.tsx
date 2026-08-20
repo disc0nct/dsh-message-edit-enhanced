@@ -58,11 +58,11 @@ function turnSections(
 }
 
 function VersionRow({ version, disabled, onOpen }: {
- version: VersionSummary
- disabled: boolean
- onOpen: (sessionId: string) => void
+  version: VersionSummary
+  disabled: boolean
+  onOpen: (sessionId: string) => void
 }): ReactNode {
- const depthStyle = { '--message-edit-depth': String(version.depth) } as CSSProperties
+  const depthStyle = { '--message-edit-enhanced-depth': String(version.depth) } as CSSProperties
  const operation = version.operation === undefined
   ? version.parentSessionId === undefined ? 'Original' : 'External Branch'
   : OPERATION_LABEL[version.operation]

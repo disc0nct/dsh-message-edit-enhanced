@@ -271,12 +271,12 @@ export class MessageEditController {
   this.observe()
  }
 
- private observe(): void {
-  this.disposeObservation = this.ctx.effect(
-   () => this.observeDependencies(),
-   `message-edit: observe ${this.sessionId}`,
-  )
- }
+  private observe(): void {
+    this.disposeObservation = this.ctx.effect(
+      () => this.observeDependencies(),
+      `message-edit-enhanced: observe ${this.sessionId}`,
+    )
+  }
 
  private release(): void {
   this.users -= 1

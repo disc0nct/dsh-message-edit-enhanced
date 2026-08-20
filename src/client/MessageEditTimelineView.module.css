@@ -263,9 +263,9 @@
 }
 
 .versionItem {
- --message-edit-depth: 0;
- position: relative;
- padding-left: calc(var(--message-edit-depth) * 14px);
+  --message-edit-enhanced-depth: 0;
+  position: relative;
+  padding-left: calc(var(--message-edit-enhanced-depth) * 14px);
 }
 
 .versionButton {

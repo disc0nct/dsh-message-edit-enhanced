@@ -1,5 +1,5 @@
 /** Same-origin endpoint owned by the Message Edit host plugin. */
-export const MESSAGE_EDIT_PATH = '/message-edit'
+export const MESSAGE_EDIT_PATH = '/message-edit-enhanced'
 
 /** Timeline sits between Trajectory (10) and Prompt Studio (20). */
 export const MESSAGE_EDIT_VIEW_ORDER = 15

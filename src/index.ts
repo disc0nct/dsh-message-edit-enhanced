@@ -62,10 +62,10 @@ export type {
 } from './shared.ts'
 
 declare module '@deepseek-ai/dsh-session' {
- interface SessionEventMap {
-  /** Durable branch provenance owned by moeblack/message-edit. */
-  'message-edit/version': StoredMessageEditVersionEvent
- }
+  interface SessionEventMap {
+    /** Durable branch provenance owned by disc0nct/message-edit-enhanced. */
+    'message-edit-enhanced/version': StoredMessageEditVersionEvent
+  }
 }
 
 interface HttpRequestLike {
@@ -96,7 +96,7 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /** Stable Cordis plugin name. */
-export const name = 'message-edit'
+export const name = 'message-edit-enhanced'
 
 /** Public services used by the branch transaction and timeline projection. */
 export const inject = [
@@ -480,7 +480,7 @@ function versionSeed(source: Session, plan: OperationPlan): {
 } {
  const events = inheritedSeed(source, plan.boundary)
  const inheritedLength = events.length
- appendLogSeedEvent(events, 'message-edit/version', plan.version)
+  appendLogSeedEvent(events, 'message-edit-enhanced/version', plan.version)
  if (plan.manualTurn !== undefined) appendManualTurn(events, plan.manualTurn)
  return { events, inheritedLength }
 }
@@ -582,13 +582,13 @@ async function runOperation(ctx: Context, operation: MessageEditOperation): Prom
 }
 
 function ownVersionEvent(
- header: SessionRecord['header'],
- events: readonly SessionEvent[],
+  header: SessionRecord['header'],
+  events: readonly SessionEvent[],
 ): VersionProjection | undefined {
- const inherited = header.seedLength ?? 0
- const ownEvents = events.filter((event): event is SessionEvent<'message-edit/version'> => (
-  event.type === 'message-edit/version' && event.seq >= inherited
- ))
+  const inherited = header.seedLength ?? 0
+  const ownEvents = events.filter((event): event is SessionEvent<'message-edit-enhanced/version'> => (
+    event.type === 'message-edit-enhanced/version' && event.seq >= inherited
+  ))
  if (ownEvents.length === 0) return undefined
  if (ownEvents.length > 1) {
   throw new Error(`Session ${header.id} contains multiple own version effects.`)
@@ -856,9 +856,9 @@ function respondJson(response: HttpResponseLike, status: number, value: unknown)
 }
 
 async function handleRoute(ctx: Context, request: HttpRequestLike, response: HttpResponseLike): Promise<void> {
- try {
-  if (request.method === 'GET') {
-   const url = new URL(request.url ?? MESSAGE_EDIT_PATH, 'http://message-edit.local')
+  try {
+    if (request.method === 'GET') {
+      const url = new URL(request.url ?? MESSAGE_EDIT_PATH, 'http://message-edit-enhanced.local')
    const sessionId = sessionIdOf(url.searchParams.get('sessionId'))
    respondJson(response, 200, await timeline(ctx, sessionId))
    return
@@ -877,9 +877,9 @@ async function handleRoute(ctx: Context, request: HttpRequestLike, response: Htt
 
 /** Register the reversible route contribution. */
 export function apply(ctx: Context): void {
- ctx.effect(() => ctx.webServer.register({
-  kind: 'exact',
-  path: MESSAGE_EDIT_PATH,
-  handler: (request, response) => handleRoute(ctx, request, response),
- }), 'message-edit: HTTP route')
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: MESSAGE_EDIT_PATH,
+    handler: (request, response) => handleRoute(ctx, request, response),
+  }), 'message-edit-enhanced: HTTP route')
 }

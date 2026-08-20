@@ -1,6 +1,6 @@
 //#region src/shared.ts
 /** Same-origin endpoint owned by the Message Edit host plugin. */
-const MESSAGE_EDIT_PATH = "/message-edit";
+const MESSAGE_EDIT_PATH = "/message-edit-enhanced";
 /** Timeline sits between Trajectory (10) and Prompt Studio (20). */
 const MESSAGE_EDIT_VIEW_ORDER = 15;
 /** Current durable event schema for structurally paired version effects. */
@@ -8,7 +8,7 @@ const MESSAGE_EDIT_VERSION_SCHEMA = 2;
 //#endregion
 //#region src/index.ts
 /** Stable Cordis plugin name. */
-const name = "message-edit";
+const name = "message-edit-enhanced";
 /** Public services used by the branch transaction and timeline projection. */
 const inject = [
 	"sessions",
@@ -313,7 +313,7 @@ function appendManualTurn(events, manual) {
 function versionSeed(source, plan) {
 	const events = inheritedSeed(source, plan.boundary);
 	const inheritedLength = events.length;
-	appendLogSeedEvent(events, "message-edit/version", plan.version);
+	appendLogSeedEvent(events, "message-edit-enhanced/version", plan.version);
 	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn);
 	return {
 		events,
@@ -406,7 +406,7 @@ async function runOperation(ctx, operation) {
 }
 function ownVersionEvent(header, events) {
 	const inherited = header.seedLength ?? 0;
-	const ownEvents = events.filter((event) => event.type === "message-edit/version" && event.seq >= inherited);
+	const ownEvents = events.filter((event) => event.type === "message-edit-enhanced/version" && event.seq >= inherited);
 	if (ownEvents.length === 0) return void 0;
 	if (ownEvents.length > 1) throw new Error(`Session ${header.id} contains multiple own version effects.`);
 	const event = ownEvents[0];
@@ -634,7 +634,7 @@ function respondJson(response, status, value) {
 async function handleRoute(ctx, request, response) {
 	try {
 		if (request.method === "GET") {
-			respondJson(response, 200, await timeline(ctx, sessionIdOf(new URL(request.url ?? "/message-edit", "http://message-edit.local").searchParams.get("sessionId"))));
+			respondJson(response, 200, await timeline(ctx, sessionIdOf(new URL(request.url ?? "/message-edit-enhanced", "http://message-edit-enhanced.local").searchParams.get("sessionId"))));
 			return;
 		}
 		if (request.method === "POST") {
@@ -654,7 +654,7 @@ function apply(ctx) {
 		kind: "exact",
 		path: MESSAGE_EDIT_PATH,
 		handler: (request, response) => handleRoute(ctx, request, response)
-	}), "message-edit: HTTP route");
+	}), "message-edit-enhanced: HTTP route");
 }
 //#endregion
 export { MESSAGE_EDIT_PATH, MESSAGE_EDIT_VERSION_SCHEMA, MESSAGE_EDIT_VIEW_ORDER, apply, inject, name };
