@@ -18,6 +18,8 @@ const inject = [
 	"workspaceRegistry",
 	"webServer"
 ];
+/** Safety limit for preserve cascades. */
+const MAX_PRESERVE_QUEUE = 20;
 function pairVersionEffect(sourceSessionId, effect) {
 	return {
 		schemaVersion: 2,
@@ -149,7 +151,7 @@ function editPlan(operation, turns) {
 		const before = event.data.content[operation.blockIndex];
 		if (before?.type !== "text") throw new Error("Selected user message block is not text.");
 		const edited = cloneUser(event.data, replaceTextBlock(event.data.content, operation.blockIndex, operation.text));
-		const later = operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1) : [];
+		const later = operation.cascade === "preserve" ? downstreamUsers(turns, turnIndex + 1).slice(0, 19) : [];
 		return {
 			boundary: turn.startSeq - 1,
 			version: pairVersionEffect(operation.sessionId, {
@@ -201,7 +203,7 @@ function retryPlan(sessionId, turnNumber, cascade, turns) {
 			targetTurn: turn.turn,
 			targetEventSeq: turn.user.seq
 		}),
-		queuedUsers: cascade === "preserve" ? downstreamUsers(turns, turnIndex) : [cloneUser(turn.user.data)]
+		queuedUsers: cascade === "preserve" ? downstreamUsers(turns, turnIndex).slice(0, MAX_PRESERVE_QUEUE) : [cloneUser(turn.user.data)]
 	};
 }
 function rerollPlan(sessionId, turns) {

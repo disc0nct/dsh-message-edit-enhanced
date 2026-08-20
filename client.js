@@ -158,7 +158,8 @@ window.__ModuleLoader__.load({
 				status: "idle",
 				error: null,
 				pending: null,
-				timeline: null
+				timeline: null,
+				switchingTo: null
 			});
 			face;
 			generation = 0;
@@ -210,9 +211,138 @@ window.__ModuleLoader__.load({
 						action: "reroll",
 						sessionId: this.sessionId
 					}),
-					openVersion: (sessionId) => this.openWhenListed(sessionId)
+					openVersion: (sessionId) => this.openWhenListed(sessionId),
+					exportBranch: (format) => this.downloadTimeline(format)
 				};
 				this.observe();
+			}
+			parentVersionSnapshot() {
+				const timeline = this.store.getSnapshot().timeline;
+				if (timeline === null) return null;
+				const current = timeline.versions.find((version) => version.current) ?? timeline.versions.at(-1) ?? null;
+				return current === null ? null : {
+					sessionId: current.sessionId,
+					depth: current.depth
+				};
+			}
+			appendStubVersion(childSessionId, operation) {
+				const timeline = this.store.getSnapshot().timeline;
+				if (timeline === null) return;
+				const parent = this.parentVersionSnapshot();
+				const parentId = parent?.sessionId ?? timeline.sessionId;
+				const depth = (parent?.depth ?? 0) + 1;
+				const eventSeq = operation.action === "edit" ? operation.eventSeq : void 0;
+				const eventTurn = (eventSeq !== void 0 ? timeline.messages.find((candidate) => candidate.eventSeq === eventSeq) : void 0)?.turn ?? 0;
+				const stamped = {
+					sessionId: childSessionId,
+					parentSessionId: parentId,
+					createdAt: Date.now(),
+					depth,
+					current: true,
+					onCurrentEffectPath: true,
+					operation: operation.action,
+					cascade: operation.action !== "reroll" ? operation.cascade : void 0,
+					...operation.action === "edit" ? {
+						targetTurn: eventTurn,
+						targetEventSeq: operation.eventSeq,
+						targetBlockIndex: operation.blockIndex,
+						blockKind: "user"
+					} : operation.action === "retry" ? { targetTurn: operation.turn } : {},
+					current: true,
+					onCurrentEffectPath: true
+				};
+				this.store.update((state) => {
+					if (state.timeline === null) return;
+					state.timeline = {
+						...state.timeline,
+						versions: [...state.timeline.versions.map((version) => ({
+							...version,
+							current: false,
+							onCurrentEffectPath: false
+						})), stamped],
+						undoStack: [childSessionId, ...state.timeline.undoStack],
+						redoSessionIds: []
+					};
+				});
+			}
+			downloadTimeline(format) {
+				const snapshot = this.store.getSnapshot();
+				if (snapshot.timeline === null) return;
+				const timeline = snapshot.timeline;
+				const payload = {
+					sessionId: timeline.sessionId,
+					exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
+					versions: timeline.versions,
+					messages: timeline.messages,
+					retryableTurns: timeline.retryableTurns,
+					undoStack: timeline.undoStack,
+					redoSessionIds: timeline.redoSessionIds
+				};
+				if (format === "markdown") {
+					const lines = [];
+					lines.push(`# Timeline Export`);
+					lines.push("");
+					lines.push(`Session: ${payload.sessionId}`);
+					lines.push(`Exported: ${payload.exportedAt}`);
+					lines.push("");
+					lines.push("---");
+					lines.push("");
+					lines.push("## Versions");
+					lines.push("");
+					for (const version of payload.versions) {
+						const marker = version.current ? " [CURRENT]" : version.onCurrentEffectPath ? " [ON PATH]" : "";
+						const label = version.operation ? `${version.operation} turn ${version.targetTurn ?? "?"}${marker}` : "Original";
+						lines.push(`- ${label} \`${version.sessionId.slice(0, 12)}\``);
+					}
+					lines.push("");
+					lines.push("---");
+					lines.push("");
+					lines.push("## Messages");
+					lines.push("");
+					for (const turn of payload.retryableTurns) {
+						lines.push(`### Turn ${turn.turn}`);
+						lines.push("");
+						const messages = payload.messages.filter((message) => message.turn === turn.turn);
+						for (const message of messages) {
+							const kind = message.kind === "user" ? "User" : message.kind === "assistant.reasoning" ? "Assistant Reasoning" : "Assistant Response";
+							lines.push(`**${kind}** \`${message.time ? new Date(message.time).toISOString() : ""}\``);
+							lines.push("");
+							lines.push(message.text || "(empty)");
+							lines.push("");
+						}
+					}
+					lines.push("---");
+					lines.push("");
+					lines.push("## JSON");
+					lines.push("");
+					lines.push("```json");
+					lines.push(JSON.stringify(payload, null, 2));
+					lines.push("```");
+					lines.push("");
+					const markdown = lines.join("\n");
+					this.scheduleDownload(`timeline-${timeline.sessionId.slice(0, 8)}.md`, markdown, "text/markdown");
+					return;
+				}
+				const json = JSON.stringify(payload, null, 2);
+				this.scheduleDownload(`timeline-${timeline.sessionId.slice(0, 8)}.json`, json, "application/json");
+			}
+			scheduleDownload(filename, content, mimeType) {
+				const blob = new Blob([content], { type: mimeType });
+				const url = URL.createObjectURL(blob);
+				if (typeof document === "undefined") {
+					URL.revokeObjectURL(url);
+					return;
+				}
+				try {
+					const a = document.createElement("a");
+					a.href = url;
+					a.download = filename;
+					document.body.appendChild(a);
+					a.click();
+					document.body.removeChild(a);
+				} finally {
+					URL.revokeObjectURL(url);
+				}
 			}
 			observe() {
 				this.disposeObservation = this.ctx.effect(() => this.observeDependencies(), `message-edit-enhanced: observe ${this.sessionId}`);
@@ -350,6 +480,7 @@ window.__ModuleLoader__.load({
 			/** Refresh only controllers whose projection has already been requested. */
 			refreshIfLoaded() {
 				if (this.disposed || this.store.getSnapshot().status === "idle") return;
+				if (this.store.getSnapshot().switchingTo !== null) return;
 				this.refresh();
 			}
 			async mutate(operation) {
@@ -372,7 +503,17 @@ window.__ModuleLoader__.load({
 					this.store.update((state) => {
 						state.pending = null;
 					});
-					await this.openWhenListed(result.sessionId);
+					try {
+						this.store.update((state) => {
+							state.switchingTo = result.sessionId;
+						});
+						await this.openWhenListed(result.sessionId);
+					} finally {
+						this.store.update((state) => {
+							state.switchingTo = null;
+						});
+					}
+					this.appendStubVersion(result.sessionId, operation);
 					return true;
 				} catch (error) {
 					if (this.disposed) return false;
@@ -424,15 +565,15 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var InlineMessageEdit_module_css_default = {
-			"picker": "D60d8a_picker",
-			"panel": "D60d8a_panel",
-			"overlay": "D60d8a_overlay",
-			"input": "D60d8a_input",
-			"footer": "D60d8a_footer",
 			"pickerItem": "D60d8a_pickerItem",
+			"overlay": "D60d8a_overlay",
+			"panel": "D60d8a_panel",
+			"footer": "D60d8a_footer",
+			"title": "D60d8a_title",
 			"pickerItemActive": "D60d8a_pickerItemActive",
 			"iconButton": "D60d8a_iconButton",
-			"title": "D60d8a_title"
+			"input": "D60d8a_input",
+			"picker": "D60d8a_picker"
 		};
 		//#endregion
 		//#region src/client/InlineMessageEdit.tsx
@@ -725,10 +866,10 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditHeader_module_css_default = {
-			"rerollButton": "EM6NxG_rerollButton",
-			"iconButton": "EM6NxG_iconButton",
+			"counter": "EM6NxG_counter",
 			"root": "EM6NxG_root",
-			"counter": "EM6NxG_counter"
+			"rerollButton": "EM6NxG_rerollButton",
+			"iconButton": "EM6NxG_iconButton"
 		};
 		//#endregion
 		//#region src/client/MessageEditHeader.tsx
@@ -793,7 +934,7 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region \0dsh-css:/home/silini/tools/deepseek plugins/dsh-message-edit-enhanced/src/client/MessageEditTimelineView.module.css.mjs
-		const css = ".kxmlFa_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.kxmlFa_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.kxmlFa_title,.kxmlFa_intro,.kxmlFa_subtitle,.kxmlFa_notice,.kxmlFa_error,.kxmlFa_empty,.kxmlFa_turnTitle,.kxmlFa_turnPreview,.kxmlFa_messageText{margin:0}.kxmlFa_title{font-size:22px;font-weight:600;line-height:30px}.kxmlFa_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.kxmlFa_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.kxmlFa_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton{box-sizing:border-box;font:inherit}.kxmlFa_select,.kxmlFa_textarea{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.kxmlFa_select{height:34px;padding:0 30px 0 9px;font-size:12px}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton{cursor:pointer;border:0}.kxmlFa_primaryButton,.kxmlFa_secondaryButton{border-radius:17px;justify-content:center;align-items:center;min-height:34px;padding:0 13px;font-size:12px;line-height:18px;display:inline-flex}.kxmlFa_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.kxmlFa_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.kxmlFa_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.kxmlFa_secondaryButton:hover:not(:disabled),.kxmlFa_textButton:hover:not(:disabled),.kxmlFa_versionButton:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.kxmlFa_primaryButton:disabled,.kxmlFa_secondaryButton:disabled,.kxmlFa_textButton:disabled,.kxmlFa_versionButton:disabled,.kxmlFa_select:disabled{cursor:default;opacity:.45}.kxmlFa_primaryButton:focus-visible,.kxmlFa_secondaryButton:focus-visible,.kxmlFa_textButton:focus-visible,.kxmlFa_versionButton:focus-visible,.kxmlFa_select:focus-visible,.kxmlFa_textarea:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_notice,.kxmlFa_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.kxmlFa_notice{color:var(--dsw-alias-state-warn-label)}.kxmlFa_error{color:var(--dsw-alias-state-error-primary)}.kxmlFa_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.kxmlFa_status .kxmlFa_error{margin:0}.kxmlFa_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.kxmlFa_versionsPanel,.kxmlFa_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.kxmlFa_versionsPanel{position:sticky;top:0}.kxmlFa_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.kxmlFa_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.kxmlFa_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.kxmlFa_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_effectButtons .kxmlFa_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.kxmlFa_subtitle{font-size:16px;font-weight:500;line-height:24px}.kxmlFa_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.kxmlFa_versionList,.kxmlFa_turnList{margin:0;padding:0;list-style:none}.kxmlFa_versionList{flex-direction:column;gap:4px;display:flex}.kxmlFa_versionItem{--message-edit-enhanced-depth:0;padding-left:calc(var(--message-edit-enhanced-depth) * 14px);position:relative}.kxmlFa_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.kxmlFa_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.kxmlFa_versionButton:not([data-current]) .kxmlFa_pathBadge{opacity:.8}.kxmlFa_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.kxmlFa_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.kxmlFa_versionButton[data-current] .kxmlFa_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.kxmlFa_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.kxmlFa_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.kxmlFa_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.kxmlFa_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.kxmlFa_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.kxmlFa_currentBadge,.kxmlFa_pathBadge,.kxmlFa_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.kxmlFa_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_turnList{flex-direction:column;gap:14px;display:flex}.kxmlFa_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.kxmlFa_turnHeader,.kxmlFa_messageHeader,.kxmlFa_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.kxmlFa_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.kxmlFa_turnTitle{font-size:14px;font-weight:500;line-height:22px}.kxmlFa_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.kxmlFa_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.kxmlFa_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.kxmlFa_messageHeader{justify-content:flex-start}.kxmlFa_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.kxmlFa_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.kxmlFa_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.kxmlFa_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.kxmlFa_editor{margin-top:8px}.kxmlFa_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.kxmlFa_editorActions{margin-top:8px}.kxmlFa_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.kxmlFa_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}@media (width<=1000px){.kxmlFa_columns{grid-template-columns:1fr}.kxmlFa_versionsPanel{position:static}}@media (width<=680px){.kxmlFa_root{padding:16px}.kxmlFa_pageHeader,.kxmlFa_headerActions,.kxmlFa_turnHeader,.kxmlFa_editorActions{flex-direction:column;align-items:stretch}.kxmlFa_headerActions,.kxmlFa_primaryButton,.kxmlFa_secondaryButton{width:100%}}";
+		const css = ".kxmlFa_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.kxmlFa_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.kxmlFa_title,.kxmlFa_intro,.kxmlFa_subtitle,.kxmlFa_notice,.kxmlFa_error,.kxmlFa_empty,.kxmlFa_turnTitle,.kxmlFa_turnPreview,.kxmlFa_messageText{margin:0}.kxmlFa_title{font-size:22px;font-weight:600;line-height:30px}.kxmlFa_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.kxmlFa_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.kxmlFa_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterSearch,.kxmlFa_filterChip{box-sizing:border-box;font:inherit}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_filterSearch{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.kxmlFa_select{height:34px;padding:0 30px 0 9px;font-size:12px}.kxmlFa_filterSearch{width:100%;height:32px;padding:0 10px;font-size:12px}.kxmlFa_filterSearch:focus{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterChip{cursor:pointer;border:0}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_filterChip{border-radius:14px;justify-content:center;align-items:center;min-height:28px;padding:0 10px;font-size:11px;line-height:18px;display:inline-flex}.kxmlFa_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.kxmlFa_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.kxmlFa_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.kxmlFa_secondaryButton:hover:not(:disabled),.kxmlFa_textButton:hover:not(:disabled),.kxmlFa_versionButton:hover:not(:disabled),.kxmlFa_filterChip:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.kxmlFa_primaryButton:disabled,.kxmlFa_secondaryButton:disabled,.kxmlFa_textButton:disabled,.kxmlFa_versionButton:disabled,.kxmlFa_filterChip:disabled,.kxmlFa_select:disabled,.kxmlFa_filterSearch:disabled{cursor:default;opacity:.45}.kxmlFa_primaryButton:focus-visible,.kxmlFa_secondaryButton:focus-visible,.kxmlFa_textButton:focus-visible,.kxmlFa_versionButton:focus-visible,.kxmlFa_filterChip:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_notice,.kxmlFa_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.kxmlFa_notice{color:var(--dsw-alias-state-warn-label)}.kxmlFa_error{color:var(--dsw-alias-state-error-primary)}.kxmlFa_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.kxmlFa_status .kxmlFa_error{margin:0}.kxmlFa_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.kxmlFa_versionsPanel,.kxmlFa_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.kxmlFa_versionsPanel{position:sticky;top:0}.kxmlFa_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.kxmlFa_filterBar{flex-direction:column;gap:8px;margin-bottom:12px;display:flex}.kxmlFa_filterChips{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_filterChip{color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);background:0 0;border-radius:12px;min-height:26px;padding:2px 8px;font-size:11px;line-height:18px}.kxmlFa_filterChip[data-active]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform)}.kxmlFa_turnFilterBar{margin-bottom:12px}.kxmlFa_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.kxmlFa_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.kxmlFa_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_effectButtons .kxmlFa_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.kxmlFa_subtitle{font-size:16px;font-weight:500;line-height:24px}.kxmlFa_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.kxmlFa_versionList,.kxmlFa_turnList{margin:0;padding:0;list-style:none}.kxmlFa_versionListScroller{min-height:120px;max-height:520px;overflow:auto}.kxmlFa_versionList{width:100%;position:relative}.kxmlFa_versionItem{--message-edit-enhanced-depth:0;padding-left:calc(var(--message-edit-enhanced-depth) * 14px);position:relative}.kxmlFa_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.kxmlFa_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.kxmlFa_versionButton:not([data-current]) .kxmlFa_pathBadge{opacity:.8}.kxmlFa_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.kxmlFa_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.kxmlFa_versionButton[data-current] .kxmlFa_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.kxmlFa_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.kxmlFa_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.kxmlFa_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.kxmlFa_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.kxmlFa_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.kxmlFa_currentBadge,.kxmlFa_pathBadge,.kxmlFa_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.kxmlFa_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_turnList{flex-direction:column;gap:14px;display:flex}.kxmlFa_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.kxmlFa_turnHeader,.kxmlFa_messageHeader,.kxmlFa_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.kxmlFa_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.kxmlFa_turnTitle{font-size:14px;font-weight:500;line-height:22px}.kxmlFa_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.kxmlFa_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.kxmlFa_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.kxmlFa_messageHeader{justify-content:flex-start}.kxmlFa_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.kxmlFa_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.kxmlFa_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.kxmlFa_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.kxmlFa_editor{margin-top:8px}.kxmlFa_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.kxmlFa_editorActions{margin-top:8px}.kxmlFa_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.kxmlFa_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}.kxmlFa_versionExpand{background:var(--dsw-alias-bg-module-hover);width:24px;height:24px;color:var(--dsw-alias-label-secondary);cursor:pointer;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;font-size:10px;line-height:1;display:flex}.kxmlFa_versionExpand:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kxmlFa_versionExpand:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionDiffPanel{background:var(--dsw-alias-bg-module-platform);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;margin-top:8px;padding:10px;animation:.15s ease-out kxmlFa_slideDown}@keyframes kxmlFa_slideDown{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.kxmlFa_versionDiffHeader{border-bottom:1px solid var(--dsw-alias-border-l2);margin-bottom:8px;padding-bottom:8px}.kxmlFa_diffLegend{color:var(--dsw-alias-label-tertiary);gap:12px;font-size:10px;display:flex}.kxmlFa_diffLegend span{border-radius:4px;padding:1px 6px}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary)}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary)}.kxmlFa_diffEqual{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary)}.kxmlFa_versionDiffContent{background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;word-wrap:break-word;border-radius:6px;max-height:300px;margin:0;padding:8px;font-family:inherit;font-size:12px;line-height:1.6;overflow:auto}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary);border-radius:2px;padding:0 2px;text-decoration:line-through}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary);border-radius:2px;padding:0 2px}.kxmlFa_diffEqual{color:var(--dsw-alias-label-secondary)}.kxmlFa_versionPin{width:26px;height:26px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:0 0;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;padding:0;font-size:14px;line-height:1;display:inline-flex}.kxmlFa_versionPin:hover{background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-brand-primary)}.kxmlFa_versionPin:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionTags{flex-wrap:wrap;gap:4px;margin-top:4px;display:inline-flex}.kxmlFa_versionTag{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-brand-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:1px 6px;font-size:10px;line-height:16px}.kxmlFa_versionNote{color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:11px;font-style:italic;line-height:16px;display:block}@media (width<=1000px){.kxmlFa_columns{grid-template-columns:1fr}.kxmlFa_versionsPanel{position:static}}@media (width<=680px){.kxmlFa_root{padding:16px}.kxmlFa_pageHeader,.kxmlFa_headerActions,.kxmlFa_turnHeader,.kxmlFa_editorActions{flex-direction:column;align-items:stretch}.kxmlFa_headerActions,.kxmlFa_primaryButton,.kxmlFa_secondaryButton{width:100%}}";
 		const tagId = "dsh-message-edit-enhanced/MessageEditTimelineView.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -803,59 +944,138 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditTimelineView_module_css_default = {
-			"title": "kxmlFa_title",
-			"cascadeField": "kxmlFa_cascadeField",
-			"sectionHeading": "kxmlFa_sectionHeading",
-			"textButton": "kxmlFa_textButton",
-			"versionList": "kxmlFa_versionList",
-			"turnList": "kxmlFa_turnList",
-			"pathBadge": "kxmlFa_pathBadge",
-			"versionLine": "kxmlFa_versionLine",
-			"versionTitle": "kxmlFa_versionTitle",
-			"versionDiff": "kxmlFa_versionDiff",
-			"editor": "kxmlFa_editor",
-			"effectControls": "kxmlFa_effectControls",
-			"currentBadge": "kxmlFa_currentBadge",
-			"primaryButton": "kxmlFa_primaryButton",
-			"turnPreview": "kxmlFa_turnPreview",
-			"status": "kxmlFa_status",
+			"pageHeader": "kxmlFa_pageHeader",
 			"subtitle": "kxmlFa_subtitle",
-			"columns": "kxmlFa_columns",
-			"notice": "kxmlFa_notice",
-			"messageText": "kxmlFa_messageText",
 			"effectButtons": "kxmlFa_effectButtons",
-			"secondaryButton": "kxmlFa_secondaryButton",
-			"messageCard": "kxmlFa_messageCard",
-			"textarea": "kxmlFa_textarea",
-			"root": "kxmlFa_root",
-			"versionItem": "kxmlFa_versionItem",
-			"select": "kxmlFa_select",
-			"versionDot": "kxmlFa_versionDot",
+			"versionTitle": "kxmlFa_versionTitle",
 			"turnHeader": "kxmlFa_turnHeader",
 			"editorActions": "kxmlFa_editorActions",
-			"effectDepth": "kxmlFa_effectDepth",
-			"messageTime": "kxmlFa_messageTime",
-			"messageHeader": "kxmlFa_messageHeader",
-			"intro": "kxmlFa_intro",
+			"versionDiffContent": "kxmlFa_versionDiffContent",
+			"diffLegend": "kxmlFa_diffLegend",
+			"notice": "kxmlFa_notice",
+			"filterChips": "kxmlFa_filterChips",
+			"effectControls": "kxmlFa_effectControls",
+			"diffDelete": "kxmlFa_diffDelete",
+			"diffEqual": "kxmlFa_diffEqual",
+			"columns": "kxmlFa_columns",
+			"sectionHeading": "kxmlFa_sectionHeading",
+			"versionDiffHeader": "kxmlFa_versionDiffHeader",
+			"cascadeField": "kxmlFa_cascadeField",
+			"versionListScroller": "kxmlFa_versionListScroller",
+			"turnList": "kxmlFa_turnList",
+			"versionMeta": "kxmlFa_versionMeta",
+			"slideDown": "kxmlFa_slideDown",
+			"versionNote": "kxmlFa_versionNote",
+			"versionItem": "kxmlFa_versionItem",
+			"secondaryButton": "kxmlFa_secondaryButton",
+			"turnTitle": "kxmlFa_turnTitle",
 			"versionMain": "kxmlFa_versionMain",
 			"headerActions": "kxmlFa_headerActions",
-			"count": "kxmlFa_count",
-			"versionMeta": "kxmlFa_versionMeta",
-			"versionsPanel": "kxmlFa_versionsPanel",
-			"kindBadge": "kxmlFa_kindBadge",
-			"pageHeader": "kxmlFa_pageHeader",
+			"messageHeader": "kxmlFa_messageHeader",
+			"versionButton": "kxmlFa_versionButton",
+			"textButton": "kxmlFa_textButton",
+			"versionTag": "kxmlFa_versionTag",
+			"versionDiffPanel": "kxmlFa_versionDiffPanel",
+			"primaryButton": "kxmlFa_primaryButton",
+			"filterSearch": "kxmlFa_filterSearch",
+			"versionExpand": "kxmlFa_versionExpand",
 			"messageList": "kxmlFa_messageList",
 			"editorHint": "kxmlFa_editorHint",
+			"versionLine": "kxmlFa_versionLine",
+			"messageText": "kxmlFa_messageText",
+			"select": "kxmlFa_select",
+			"versionList": "kxmlFa_versionList",
+			"title": "kxmlFa_title",
+			"versionsPanel": "kxmlFa_versionsPanel",
+			"messageTime": "kxmlFa_messageTime",
+			"editor": "kxmlFa_editor",
+			"empty": "kxmlFa_empty",
+			"intro": "kxmlFa_intro",
+			"versionDiff": "kxmlFa_versionDiff",
+			"diffInsert": "kxmlFa_diffInsert",
+			"turnPreview": "kxmlFa_turnPreview",
+			"count": "kxmlFa_count",
+			"filterChip": "kxmlFa_filterChip",
+			"currentBadge": "kxmlFa_currentBadge",
+			"kindBadge": "kxmlFa_kindBadge",
+			"versionDot": "kxmlFa_versionDot",
 			"error": "kxmlFa_error",
+			"root": "kxmlFa_root",
+			"textarea": "kxmlFa_textarea",
+			"effectDepth": "kxmlFa_effectDepth",
+			"versionPin": "kxmlFa_versionPin",
+			"pathBadge": "kxmlFa_pathBadge",
 			"turnSection": "kxmlFa_turnSection",
-			"turnTitle": "kxmlFa_turnTitle",
-			"versionButton": "kxmlFa_versionButton",
+			"status": "kxmlFa_status",
+			"turnFilterBar": "kxmlFa_turnFilterBar",
+			"messageCard": "kxmlFa_messageCard",
+			"versionTags": "kxmlFa_versionTags",
 			"turnsPanel": "kxmlFa_turnsPanel",
-			"empty": "kxmlFa_empty"
+			"filterBar": "kxmlFa_filterBar"
 		};
 		//#endregion
 		//#region src/client/MessageEditTimelineView.tsx
 		/** Timeline tab: durable version tree plus turn/block edit and retry controls. */
+		/** Compute a simple word-level diff between two strings. */
+		function computeDiff(before, after) {
+			const beforeWords = before.split(/(\s+)/);
+			const afterWords = after.split(/(\s+)/);
+			const m = beforeWords.length;
+			const n = afterWords.length;
+			const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+			for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) {
+				const prevRow = dp[i - 1];
+				const currRow = dp[i];
+				if (prevRow === void 0 || currRow === void 0) continue;
+				const bw = beforeWords[i - 1];
+				const aw = afterWords[j - 1];
+				if (bw !== void 0 && aw !== void 0 && bw === aw) {
+					const prev = prevRow[j - 1];
+					if (prev !== void 0) currRow[j] = prev + 1;
+				} else {
+					const a = prevRow[j] ?? 0;
+					const b = currRow[j - 1] ?? 0;
+					currRow[j] = Math.max(a, b);
+				}
+			}
+			const chunks = [];
+			let i = m;
+			let j = n;
+			while (i > 0 || j > 0) {
+				const currRow = dp[i];
+				const prevRow = dp[i - 1];
+				if (currRow === void 0 || prevRow === void 0) break;
+				const bw = i > 0 ? beforeWords[i - 1] : void 0;
+				const aw = j > 0 ? afterWords[j - 1] : void 0;
+				if (i > 0 && j > 0 && bw !== void 0 && aw !== void 0 && bw === aw) {
+					chunks.unshift({
+						type: "equal",
+						value: bw
+					});
+					i--;
+					j--;
+				} else if (j > 0 && (i === 0 || (currRow[j] ?? 0) >= (prevRow[j - 1] ?? 0))) {
+					chunks.unshift({
+						type: "insert",
+						value: aw ?? ""
+					});
+					j--;
+				} else {
+					chunks.unshift({
+						type: "delete",
+						value: bw ?? ""
+					});
+					i--;
+				}
+			}
+			const merged = [];
+			for (const chunk of chunks) {
+				const last = merged[merged.length - 1];
+				if (last && last.type === chunk.type) last.value += chunk.value;
+				else merged.push({ ...chunk });
+			}
+			return merged;
+		}
 		const BLOCK_LABEL = {
 			user: "User Message",
 			"assistant.reasoning": "Assistant Reasoning",
@@ -866,6 +1086,47 @@ window.__ModuleLoader__.load({
 			reroll: "Reroll",
 			retry: "Retry"
 		};
+		const FILTER_LABEL = {
+			all: "All",
+			edit: "Edit",
+			reroll: "Reroll",
+			retry: "Retry",
+			current: "Current",
+			"on-path": "On Path",
+			pinned: "Pinned"
+		};
+		const META_STORAGE_KEY = "dsh-message-edit-enhanced:version-meta";
+		function loadVersionMeta() {
+			try {
+				const raw = localStorage.getItem(META_STORAGE_KEY);
+				return raw ? JSON.parse(raw) : {};
+			} catch {
+				return {};
+			}
+		}
+		function saveVersionMeta(meta) {
+			try {
+				localStorage.setItem(META_STORAGE_KEY, JSON.stringify(meta));
+			} catch {}
+		}
+		function getVersionMeta(versionId, meta) {
+			return meta[versionId] ?? {
+				pinned: false,
+				tags: [],
+				note: ""
+			};
+		}
+		function updateVersionMeta(versionId, updates, meta) {
+			const next = {
+				...meta,
+				[versionId]: {
+					...getVersionMeta(versionId, meta),
+					...updates
+				}
+			};
+			saveVersionMeta(next);
+			return next;
+		}
 		function timeLabel(value) {
 			return new Date(value).toLocaleString("en-US", {
 				month: "2-digit",
@@ -875,26 +1136,64 @@ window.__ModuleLoader__.load({
 				second: "2-digit"
 			});
 		}
+		function matchesFilter(version, filter, pinnedMeta) {
+			switch (filter) {
+				case "all": return true;
+				case "current": return version.current;
+				case "on-path": return version.onCurrentEffectPath;
+				case "pinned": return getVersionMeta(version.sessionId, pinnedMeta).pinned;
+				default: return version.operation === filter;
+			}
+		}
+		function matchesSearch(version, query) {
+			if (query.length === 0) return true;
+			const q = query.toLowerCase();
+			return [
+				version.sessionId,
+				version.parentSessionId,
+				version.effectId,
+				version.inverseSessionId,
+				version.operation,
+				version.cascade,
+				version.before,
+				version.after,
+				version.targetTurn === void 0 ? void 0 : String(version.targetTurn)
+			].some((field) => field !== void 0 && field.toLowerCase().includes(q));
+		}
 		function turnSections(turns, messages) {
 			return turns.map((retry) => ({
 				retry,
 				messages: messages.filter((message) => message.turn === retry.turn)
 			}));
 		}
-		function VersionRow({ version, disabled, onOpen }) {
+		function VersionRow({ version, disabled, onOpen, meta, onTogglePin }) {
 			const depthStyle = { "--message-edit-enhanced-depth": String(version.depth) };
 			const operation = version.operation === void 0 ? version.parentSessionId === void 0 ? "Original" : "External Branch" : OPERATION_LABEL[version.operation];
-			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", {
+			const hasDiff = version.before !== void 0 || version.after !== void 0;
+			const [expanded, setExpanded] = (0, react.useState)(false);
+			const diffChunks = hasDiff ? computeDiff(version.before || "", version.after || "") : [];
+			const handleClick = (e) => {
+				if (e.target.closest(".version-expand")) return;
+				if (e.target.closest(".version-pin")) return;
+				onOpen(version.sessionId);
+			};
+			const handleExpandClick = (e) => {
+				e.stopPropagation();
+				setExpanded(!expanded);
+			};
+			const handlePinClick = (e) => {
+				e.stopPropagation();
+				onTogglePin(version.sessionId, !meta.pinned);
+			};
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
 				className: MessageEditTimelineView_module_css_default["versionItem"],
 				style: depthStyle,
-				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 					type: "button",
 					className: MessageEditTimelineView_module_css_default["versionButton"],
 					"data-current": version.current || void 0,
 					disabled: version.current || disabled,
-					onClick: () => {
-						onOpen(version.sessionId);
-					},
+					onClick: handleClick,
 					children: [
 						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 							className: MessageEditTimelineView_module_css_default["versionLine"],
@@ -919,11 +1218,27 @@ window.__ModuleLoader__.load({
 										version.sessionId.slice(0, 12)
 									]
 								}),
-								version.before === void 0 && version.after === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-									className: MessageEditTimelineView_module_css_default["versionDiff"],
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: ["Before: ", version.before || "(empty)"] }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: ["After: ", version.after || "(empty)"] })]
+								meta.tags.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: MessageEditTimelineView_module_css_default["versionTags"],
+									children: meta.tags.map((tag, idx) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										className: MessageEditTimelineView_module_css_default["versionTag"],
+										children: ["#", tag]
+									}, idx))
+								}),
+								meta.note && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: MessageEditTimelineView_module_css_default["versionNote"],
+									children: meta.note
 								})
 							]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: MessageEditTimelineView_module_css_default["versionPin"],
+							onClick: handlePinClick,
+							"aria-label": meta.pinned ? "Unpin version" : "Pin version",
+							"aria-pressed": meta.pinned,
+							title: meta.pinned ? "Unpin" : "Pin",
+							children: meta.pinned ? "📌" : "📍"
 						}),
 						version.current ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 							className: MessageEditTimelineView_module_css_default["currentBadge"],
@@ -931,9 +1246,45 @@ window.__ModuleLoader__.load({
 						}) : version.onCurrentEffectPath ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 							className: MessageEditTimelineView_module_css_default["pathBadge"],
 							children: "On Path"
-						}) : null
+						}) : null,
+						hasDiff && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: MessageEditTimelineView_module_css_default["versionExpand"],
+							onClick: handleExpandClick,
+							"aria-label": expanded ? "Collapse diff" : "Expand diff",
+							"aria-expanded": expanded,
+							children: expanded ? "▲" : "▼"
+						})
 					]
-				})
+				}), expanded && hasDiff && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: MessageEditTimelineView_module_css_default["versionDiffPanel"],
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: MessageEditTimelineView_module_css_default["versionDiffHeader"],
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: MessageEditTimelineView_module_css_default["diffLegend"],
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: MessageEditTimelineView_module_css_default["diffDelete"],
+									children: "Removed"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: MessageEditTimelineView_module_css_default["diffInsert"],
+									children: "Added"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: MessageEditTimelineView_module_css_default["diffEqual"],
+									children: "Unchanged"
+								})
+							]
+						})
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("pre", {
+						className: MessageEditTimelineView_module_css_default["versionDiffContent"],
+						children: diffChunks.map((chunk, idx) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: MessageEditTimelineView_module_css_default[`diff${chunk.type.charAt(0).toUpperCase() + chunk.type.slice(1)}`],
+							children: chunk.value
+						}, idx))
+					})]
+				})]
 			});
 		}
 		function MessageCard({ message, editing, disabled, cascade, onBeginEdit, onCancelEdit, onTextChange, onApplyEdit }) {
@@ -994,10 +1345,18 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/** Conversation-view entry point. */
-		function MessageEditTimelineView({ useMessageEdit, acquire, load, edit, retry, reroll, openVersion }) {
+		function MessageEditTimelineView({ useMessageEdit, acquire, load, edit, retry, reroll, openVersion, exportBranch }) {
 			const state = useMessageEdit((value) => value);
 			const [cascade, setCascade] = (0, react.useState)("truncate");
 			const [editing, setEditing] = (0, react.useState)(null);
+			const [versionFilter, setVersionFilter] = (0, react.useState)("all");
+			const [versionSearch, setVersionSearch] = (0, react.useState)("");
+			const [turnSearch, setTurnSearch] = (0, react.useState)("");
+			const [versionMeta, setVersionMeta] = (0, react.useState)(() => loadVersionMeta());
+			const [exportFormat, setExportFormat] = (0, react.useState)("json");
+			(0, react.useEffect)(() => {
+				saveVersionMeta(versionMeta);
+			}, [versionMeta]);
 			(0, react.useEffect)(() => {
 				const release = acquire();
 				load();
@@ -1012,6 +1371,61 @@ window.__ModuleLoader__.load({
 					return timeline.messages.some((message) => message.key === current.message.key) ? current : null;
 				});
 			}, [timeline]);
+			const filteredVersions = (0, react.useMemo)(() => {
+				if (timeline === null) return [];
+				return timeline.versions.filter((version) => matchesFilter(version, versionFilter, versionMeta) && matchesSearch(version, versionSearch));
+			}, [
+				timeline,
+				versionFilter,
+				versionSearch,
+				versionMeta
+			]);
+			const filteredSections = (0, react.useMemo)(() => {
+				if (timeline === null) return [];
+				const q = turnSearch.toLowerCase();
+				if (q.length === 0) return sections;
+				return sections.map((section) => ({
+					...section,
+					messages: section.messages.filter((m) => m.text.toLowerCase().includes(q) || m.kind.toLowerCase().includes(q) || String(m.turn).includes(q))
+				})).filter((section) => section.messages.length > 0);
+			}, [
+				timeline,
+				sections,
+				turnSearch
+			]);
+			/** Lightweight list virtualization bounds. */
+			const VERSION_ROW_ESTIMATED_HEIGHT = 68;
+			const VIRTUAL_BUFFER = 8;
+			const versionListRef = (0, react.useRef)(null);
+			const [scrollTop, setScrollTop] = (0, react.useState)(0);
+			const [viewportHeight, setViewportHeight] = (0, react.useState)(0);
+			(0, react.useEffect)(() => {
+				const el = versionListRef.current;
+				if (!el) return;
+				setViewportHeight(el.clientHeight);
+				const onScroll = () => setScrollTop(el.scrollTop);
+				el.addEventListener("scroll", onScroll, { passive: true });
+				return () => el.removeEventListener("scroll", onScroll);
+			}, [timeline]);
+			(0, react.useEffect)(() => {
+				const el = versionListRef.current;
+				if (el) el.scrollTop = 0;
+				setScrollTop(0);
+			}, [versionFilter, versionSearch]);
+			const virtualWindow = (0, react.useMemo)(() => {
+				const total = filteredVersions.length;
+				const start = Math.max(0, Math.floor(scrollTop / VERSION_ROW_ESTIMATED_HEIGHT) - VIRTUAL_BUFFER);
+				const visibleCount = Math.max(1, Math.ceil(viewportHeight / VERSION_ROW_ESTIMATED_HEIGHT));
+				return {
+					total,
+					start,
+					end: Math.min(total, start + visibleCount + 16)
+				};
+			}, [
+				filteredVersions.length,
+				scrollTop,
+				viewportHeight
+			]);
 			if (timeline === null && (state.status === "idle" || state.status === "loading")) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 				className: MessageEditTimelineView_module_css_default["status"],
 				children: "Loading message timeline…"
@@ -1032,6 +1446,9 @@ window.__ModuleLoader__.load({
 			const applyEdit = (message, text, policy) => {
 				setEditing(null);
 				edit(message, text, policy);
+			};
+			const togglePin = (sessionId, pinned) => {
+				setVersionMeta((prev) => updateVersionMeta(sessionId, { pinned }, prev));
 			};
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: MessageEditTimelineView_module_css_default["root"],
@@ -1082,6 +1499,10 @@ window.__ModuleLoader__.load({
 						className: MessageEditTimelineView_module_css_default["notice"],
 						children: "Refreshing timeline…"
 					}) : null,
+					state.switchingTo !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+						className: MessageEditTimelineView_module_css_default["notice"],
+						children: ["Switching session… ", /* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: state.switchingTo.slice(0, 12) })]
+					}) : null,
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: MessageEditTimelineView_module_css_default["columns"],
 						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("aside", {
@@ -1090,12 +1511,68 @@ window.__ModuleLoader__.load({
 							children: [
 								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									className: MessageEditTimelineView_module_css_default["sectionHeading"],
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
-										className: MessageEditTimelineView_module_css_default["subtitle"],
-										children: "Version Timeline"
-									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										className: MessageEditTimelineView_module_css_default["count"],
-										children: String(timeline.versions.length)
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
+											className: MessageEditTimelineView_module_css_default["subtitle"],
+											children: "Version Timeline"
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											className: MessageEditTimelineView_module_css_default["count"],
+											children: [
+												String(filteredVersions.length),
+												" / ",
+												String(timeline.versions.length)
+											]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
+											className: MessageEditTimelineView_module_css_default["select"],
+											value: exportFormat,
+											disabled: busy || timeline === null,
+											onChange: (event) => {
+												setExportFormat(event.currentTarget.value);
+											},
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+												value: "json",
+												children: "JSON"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+												value: "markdown",
+												children: "Markdown"
+											})]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: MessageEditTimelineView_module_css_default["secondaryButton"],
+											disabled: busy || timeline === null,
+											onClick: () => {
+												exportBranch(exportFormat);
+											},
+											title: `Export current timeline as ${exportFormat.toUpperCase()}`,
+											children: "Export"
+										})
+									]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: MessageEditTimelineView_module_css_default["filterBar"],
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										type: "search",
+										className: MessageEditTimelineView_module_css_default["filterSearch"],
+										placeholder: "Search versions…",
+										value: versionSearch,
+										onChange: (event) => {
+											setVersionSearch(event.currentTarget.value);
+										}
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										className: MessageEditTimelineView_module_css_default["filterChips"],
+										children: Object.keys(FILTER_LABEL).map((filter) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: MessageEditTimelineView_module_css_default["filterChip"],
+											"data-active": versionFilter === filter || void 0,
+											disabled: busy,
+											onClick: () => {
+												setVersionFilter(filter);
+											},
+											children: FILTER_LABEL[filter]
+										}, filter))
 									})]
 								}),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -1130,79 +1607,120 @@ window.__ModuleLoader__.load({
 										})]
 									})]
 								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("ol", {
-									className: MessageEditTimelineView_module_css_default["versionList"],
-									children: timeline.versions.map((version) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(VersionRow, {
-										version,
-										disabled: busy,
-										onOpen: (sessionId) => {
-											openVersion(sessionId);
-										}
-									}, version.sessionId))
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: MessageEditTimelineView_module_css_default["versionListScroller"],
+									ref: versionListRef,
+									children: filteredVersions.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", {
+										className: MessageEditTimelineView_module_css_default["empty"],
+										children: "No versions match the current filter."
+									}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ol", {
+										className: MessageEditTimelineView_module_css_default["versionList"],
+										style: {
+											height: `${virtualWindow.total * VERSION_ROW_ESTIMATED_HEIGHT}px`,
+											position: "relative"
+										},
+										children: filteredVersions.slice(virtualWindow.start, virtualWindow.end).map((version, index) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", {
+											className: MessageEditTimelineView_module_css_default["versionItem"],
+											style: {
+												position: "absolute",
+												top: `${(virtualWindow.start + index) * VERSION_ROW_ESTIMATED_HEIGHT}px`,
+												left: 0,
+												right: 0
+											},
+											children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(VersionRow, {
+												version,
+												disabled: busy,
+												onOpen: (sessionId) => {
+													openVersion(sessionId);
+												},
+												meta: getVersionMeta(version.sessionId, versionMeta),
+												onTogglePin: togglePin
+											})
+										}, version.sessionId))
+									})
 								})
 							]
 						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("main", {
 							className: MessageEditTimelineView_module_css_default["turnsPanel"],
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-								className: MessageEditTimelineView_module_css_default["sectionHeading"],
-								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
-									className: MessageEditTimelineView_module_css_default["subtitle"],
-									children: "Settled Messages"
-								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									className: MessageEditTimelineView_module_css_default["count"],
-									children: String(timeline.messages.length)
-								})]
-							}), sections.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-								className: MessageEditTimelineView_module_css_default["empty"],
-								children: "No settled turns available to edit in this session."
-							}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ol", {
-								className: MessageEditTimelineView_module_css_default["turnList"],
-								children: sections.map((section) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
-									className: MessageEditTimelineView_module_css_default["turnSection"],
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-										className: MessageEditTimelineView_module_css_default["turnHeader"],
-										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("h3", {
-											className: MessageEditTimelineView_module_css_default["turnTitle"],
-											children: ["Turn ", String(section.retry.turn)]
-										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: MessageEditTimelineView_module_css_default["turnPreview"],
-											children: section.retry.preview || "(empty user input)"
-										})] }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											className: MessageEditTimelineView_module_css_default["secondaryButton"],
-											disabled: busy,
-											onClick: () => {
-												retry(section.retry.turn, cascade);
-											},
-											children: state.pending === "retry" ? "Retrying…" : "Retry This Turn"
-										})]
-									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: MessageEditTimelineView_module_css_default["messageList"],
-										children: section.messages.map((message) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(MessageCard, {
-											message,
-											editing,
-											disabled: busy,
-											cascade,
-											onBeginEdit: (value) => {
-												setEditing({
-													message: value,
-													text: value.text
-												});
-											},
-											onCancelEdit: () => {
-												setEditing(null);
-											},
-											onTextChange: (text) => {
-												setEditing((current) => current === null ? null : {
-													...current,
-													text
-												});
-											},
-											onApplyEdit: applyEdit
-										}, message.key))
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: MessageEditTimelineView_module_css_default["sectionHeading"],
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
+										className: MessageEditTimelineView_module_css_default["subtitle"],
+										children: "Settled Messages"
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										className: MessageEditTimelineView_module_css_default["count"],
+										children: [
+											String(filteredSections.reduce((sum, s) => sum + s.messages.length, 0)),
+											" / ",
+											String(timeline.messages.length)
+										]
 									})]
-								}, section.retry.turn))
-							})]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: MessageEditTimelineView_module_css_default["turnFilterBar"],
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										type: "search",
+										className: MessageEditTimelineView_module_css_default["filterSearch"],
+										placeholder: "Search messages…",
+										value: turnSearch,
+										onChange: (event) => {
+											setTurnSearch(event.currentTarget.value);
+										}
+									})
+								}),
+								filteredSections.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: MessageEditTimelineView_module_css_default["empty"],
+									children: "No settled turns available to edit in this session."
+								}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ol", {
+									className: MessageEditTimelineView_module_css_default["turnList"],
+									children: filteredSections.map((section) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
+										className: MessageEditTimelineView_module_css_default["turnSection"],
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: MessageEditTimelineView_module_css_default["turnHeader"],
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("h3", {
+												className: MessageEditTimelineView_module_css_default["turnTitle"],
+												children: ["Turn ", String(section.retry.turn)]
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+												className: MessageEditTimelineView_module_css_default["turnPreview"],
+												children: section.retry.preview || "(empty user input)"
+											})] }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												className: MessageEditTimelineView_module_css_default["secondaryButton"],
+												disabled: busy,
+												onClick: () => {
+													retry(section.retry.turn, cascade);
+												},
+												children: state.pending === "retry" ? "Retrying…" : "Retry This Turn"
+											})]
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: MessageEditTimelineView_module_css_default["messageList"],
+											children: section.messages.map((message) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(MessageCard, {
+												message,
+												editing,
+												disabled: busy,
+												cascade,
+												onBeginEdit: (value) => {
+													setEditing({
+														message: value,
+														text: value.text
+													});
+												},
+												onCancelEdit: () => {
+													setEditing(null);
+												},
+												onTextChange: (text) => {
+													setEditing((current) => current === null ? null : {
+														...current,
+														text
+													});
+												},
+												onApplyEdit: applyEdit
+											}, message.key))
+										})]
+									}, section.retry.turn))
+								})
+							]
 						})]
 					})
 				]
