@@ -1,10 +1,8 @@
 # DSH Message Edit Enhanced
 
-[![npm version](https://img.shields.io/npm/v/dsh-message-edit-enhanced)](https://www.npmjs.com/package/dsh-message-edit-enhanced)
-[![npm downloads](https://img.shields.io/npm/dm/dsh-message-edit-enhanced)](https://www.npmjs.com/package/dsh-message-edit-enhanced)
-[![license](https://img.shields.io/npm/l/dsh-message-edit-enhanced)](LICENSE)
+[![license](https://img.shields.io/github/license/disc0nct/dsh-message-edit-enhanced)](LICENSE)
 
-`dsh-message-edit-enhanced` ([npm](https://www.npmjs.com/package/dsh-message-edit-enhanced) · [GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
+`dsh-message-edit-enhanced` ([GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
 
 ```bash
 dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhanced
@@ -92,11 +90,11 @@ Components use CSS Modules and `--dsw-*` semantic tokens without adding a UI lib
 ## Build
 
 ```bash
-npm install
-npm run build
+pnpm install
+pnpm run build
 ```
 
-The build is based on `@deepseek-ai/*@0.1.0-rc.6` types published to npm and the local toolchain (typescript, tsdown, lightningcss), no longer depending on the dsh source tree. The build generates:
+The build is based on `@deepseek-ai/*@0.1.0-rc.6` types and the local toolchain (typescript, tsdown, lightningcss), no longer depending on the dsh source tree. The build generates:
 
 - `index.mjs`: Host plugin
 - `client.js`: Browser plugin

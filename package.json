@@ -30,10 +30,9 @@
    ]
   }
  },
- "scripts": {
-  "build": "node ./scripts/build.mjs",
-  "prepublishOnly": "npm run build"
- },
+  "scripts": {
+    "build": "node ./scripts/build.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/disc0nct/dsh-message-edit-enhanced.git"
