@@ -111,6 +111,67 @@ export const inject = [
 /** Safety limit for preserve cascades. */
 const MAX_PRESERVE_QUEUE = 20
 
+/** Per-session FIFO of in-flight operations: edits/rerolls/retries against the
+ * same session run one at a time so `runMaintenance` never races itself. */
+const sessionOperationQueues = new Map<string, Promise<unknown>>()
+
+/** Chain one operation behind any pending operation on the same session. */
+function serializeSessionOperation<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+ const previous = sessionOperationQueues.get(sessionId) ?? Promise.resolve()
+ const next = previous.then(() => task(), () => task())
+ sessionOperationQueues.set(sessionId, next)
+ void next.finally(() => {
+  if (sessionOperationQueues.get(sessionId) === next) sessionOperationQueues.delete(sessionId)
+ })
+ return next
+}
+
+/** The agent loop rejects maintenance work while a turn is streaming. */
+const AGENT_BUSY_MARKER = 'already has active work'
+
+/** Bounded TTL cache for value-level timeline projections. */
+const TIMELINE_CACHE_TTL_MS = 5_000
+const TIMELINE_CACHE_MAX = 50
+
+interface TimelineCacheEntry {
+ key: string
+ result: MessageEditTimeline
+ time: number
+}
+
+const timelineCache = new Map<string, TimelineCacheEntry>()
+
+/** Invalidate one session's cached projection (call on POST). */
+function invalidateTimelineCache(sessionId: string): void {
+ timelineCache.delete(sessionId)
+}
+
+function timelineCacheKey(sessionId: string, lineage: Array<{ record: SessionRecord }>, currentLength: number): string {
+ const nodes = lineage.map(({ record }) => {
+  const live = record.header.id === sessionId ? String(currentLength) : ''
+  return `${record.header.id}:${record.header.seedLength ?? 0}:${record.header.createdAt}:${live}`
+ }).join('|')
+ return nodes
+}
+
+function cacheTimeline(sessionId: string, key: string, result: MessageEditTimeline): void {
+ if (timelineCache.size >= TIMELINE_CACHE_MAX) {
+  const oldest = timelineCache.keys().next().value
+  if (oldest !== undefined) timelineCache.delete(oldest)
+ }
+ timelineCache.set(sessionId, { key, result, time: Date.now() })
+}
+
+function cachedTimeline(sessionId: string, key: string): MessageEditTimeline | undefined {
+ const entry = timelineCache.get(sessionId)
+ if (entry === undefined || entry.key !== key) return undefined
+ if (Date.now() - entry.time > TIMELINE_CACHE_TTL_MS) {
+  timelineCache.delete(sessionId)
+  return undefined
+ }
+ return entry.result
+}
+
 type UserEvent = SessionEvent<'user/message'>
 type AssistantEvent = SessionEvent<'assistant/message'>
 
@@ -414,7 +475,6 @@ async function withSourceAgent<T>(
  ctx: Context,
  sessionId: SessionId,
  operation: (agent: Agent) => Promise<T>,
- keepAlive = false,
 ): Promise<T> {
  let handle: AgentHandle | undefined
  let agent = ctx.agents.get(sessionId)
@@ -429,7 +489,7 @@ async function withSourceAgent<T>(
  try {
   return await agent.runMaintenance(async () => operation(agent))
  } finally {
-  if (!keepAlive) await handle?.dispose()
+  await handle?.dispose()
  }
 }
 
@@ -555,53 +615,75 @@ async function recoverOperation(inverses: OperationInverse[]): Promise<void> {
  if (failures.length > 0) throw new AggregateError(failures, 'Failed to recover version operation.')
 }
 
+function isInPlaceEligible(ctx: Context, sourceId: SessionId, operation: EditOperation): boolean {
+ const sourceSession = ctx.sessions.get(sourceId)
+ if (sourceSession === undefined) return false
+ const agent = ctx.agents.get(sourceId)
+ if (agent === undefined) return false
+ const target = sourceSession.events[operation.eventSeq]
+ if (target?.type !== 'user/message') return false
+ return sourceSession.surface.nodes.includes(operation.eventSeq)
+}
+
 async function runInPlaceEdit(
  ctx: Context,
- source: Agent,
+ sourceId: SessionId,
  operation: EditOperation,
 ): Promise<MessageEditOperationResult> {
- const session = source.session
- const events = session.events
- const turns = closedTurns(events)
- const turnIndex = turns.findIndex(turn => operation.eventSeq > turn.startSeq && operation.eventSeq < turn.endSeq)
- const turn = turns[turnIndex]
- if (turn === undefined) throw new Error('Selected message does not belong to a settled turn.')
- const target = turn.user?.seq === operation.eventSeq ? turn.user : undefined
- if (target?.type !== 'user/message') throw new Error('In-place edit requires a user message.')
- const before = target.data.content[operation.blockIndex]
- if (before?.type !== 'text') throw new Error('Selected user message block is not text.')
- const edited = cloneUser(target.data, replaceTextBlock(target.data.content, operation.blockIndex, operation.text))
+ const agent = ctx.agents.get(sourceId)
+ if (agent === undefined) throw new Error('Session agent is not live; cannot edit in place.')
+ return agent.runMaintenance(async () => {
+  const session = agent.session
+  const events = session.events
+  const turns = closedTurns(events)
+  const turnIndex = turns.findIndex(turn => operation.eventSeq > turn.startSeq && operation.eventSeq < turn.endSeq)
+  const turn = turns[turnIndex]
+  if (turn === undefined) throw new Error('Selected message does not belong to a settled turn.')
+  const target = turn.user?.seq === operation.eventSeq ? turn.user : undefined
+  if (target?.type !== 'user/message') throw new Error('In-place edit requires a user message.')
+  const before = target.data.content[operation.blockIndex]
+  if (before?.type !== 'text') throw new Error('Selected user message block is not text.')
+  const edited = cloneUser(target.data, replaceTextBlock(target.data.content, operation.blockIndex, operation.text))
 
- const nodes = session.surface.nodes
- const startIdx = nodes.indexOf(operation.eventSeq)
- if (startIdx === -1) throw new Error('Target message is no longer on the conversation surface.')
- const shadowed = nodes.slice(startIdx)
- const start = shadowed[0]
- const end = shadowed[shadowed.length - 1]
- if (start === undefined || end === undefined) throw new Error('Target message has no surface span to truncate.')
+  const nodes = session.surface.nodes
+  const startIdx = nodes.indexOf(operation.eventSeq)
+  if (startIdx === -1) throw new Error('Target message is no longer on the conversation surface.')
+  const shadowed = nodes.slice(startIdx)
+  const start = shadowed[0]
+  const end = shadowed[shadowed.length - 1]
+  if (start === undefined || end === undefined) throw new Error('Target message has no surface span to truncate.')
 
- const options = agentOptions(events, source.options)
- const provider = options.provider
- const model = options.model
- if (provider === undefined || model === undefined) throw new Error('Unable to resolve model route for in-place edit.')
- const nextTurn = (turns.at(-1)?.turn ?? 0) + 1
- const emptyMessage = Object.freeze({
-  id: crypto.randomUUID() as unknown as AssistantMessage['id'],
-  role: 'assistant' as const,
-  content: Object.freeze([] as ContentBlock[]),
-  source: Object.freeze({ kind: 'model' as const, provider, model }),
- }) as AssistantMessage
- session.append('assistant/message', {
-  turn: nextTurn,
-  step: 1,
-  message: emptyMessage,
- }, {
-  surfaceOp: { op: 'replace', start, end },
-  sourceEventSeqs: [...shadowed],
+  const options = agentOptions(events, agent.options)
+  const provider = options.provider
+  const model = options.model
+  if (provider === undefined || model === undefined) throw new Error('Unable to resolve model route for in-place edit.')
+  const nextTurn = (turns.at(-1)?.turn ?? 0) + 1
+  const emptyMessage = Object.freeze({
+   id: crypto.randomUUID() as unknown as AssistantMessage['id'],
+   role: 'assistant' as const,
+   content: Object.freeze([] as ContentBlock[]),
+   source: Object.freeze({ kind: 'model' as const, provider, model }),
+  }) as AssistantMessage
+  session.append('assistant/message', {
+   turn: nextTurn,
+   step: 1,
+   message: emptyMessage,
+  }, {
+   surfaceOp: { op: 'replace', start, end },
+   sourceEventSeqs: [...shadowed],
+  })
+  // Queue the regeneration BEFORE flushing, so a failed flush never strands
+  // a truncated surface without a queued response.
+  agent.followup(edited)
+  try {
+   await ctx.sessions.flush(session)
+  } catch (error) {
+   // Durability hiccup: the regeneration is already queued and the loop will
+   // persist the turn on the next boundary. Log and continue.
+   console.warn('In-place edit: flush failed, regeneration continues in memory.', error)
+  }
+  return { sessionId: session.id, queuedTurns: 1 }
  })
- await ctx.sessions.flush(session)
- source.followup(edited)
- return { sessionId: session.id, queuedTurns: 1 }
 }
 
 async function runForkOperation(
@@ -640,17 +722,8 @@ async function runForkOperation(
 
 export async function runOperation(ctx: Context, operation: MessageEditOperation): Promise<MessageEditOperationResult> {
  const sourceId = sessionIdOf(operation.sessionId)
- if (operation.action === 'edit') {
-  const sourceSession = ctx.sessions.get(sourceId)
-  const events = sourceSession !== undefined ? sourceSession.events : (await ctx.sessionQuery.readSession(sourceId)).events
-  const target = events[operation.eventSeq]
-  const onSurface = sourceSession !== undefined
-   ? sourceSession.surface.nodes.includes(operation.eventSeq)
-   : false
-  if (target?.type === 'user/message' && onSurface) {
-   return withSourceAgent(ctx, sourceId, async (source) => runInPlaceEdit(ctx, source, operation), true)
-  }
-  return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation))
+ if (operation.action === 'edit' && isInPlaceEligible(ctx, sourceId, operation)) {
+  return runInPlaceEdit(ctx, sourceId, operation)
  }
  return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation))
 }
@@ -779,6 +852,16 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   : targetTrace.ancestors.at(-1)?.header.id ?? sessionId
  const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId)
  const lineage = flattenLineage(rootTrace.target, rootTrace.descendants)
+
+ const liveCurrent = ctx.sessions.get(sessionId)
+ const currentLength = liveCurrent !== undefined ? liveCurrent.events.length : -1
+ const cacheable = liveCurrent !== undefined && sessionId === rootId
+ if (cacheable) {
+  const key = timelineCacheKey(sessionId, lineage, currentLength)
+  const hit = cachedTimeline(sessionId, key)
+  if (hit !== undefined) return hit
+ }
+
  const logs = await mapConcurrent(lineage, async ({ record }): Promise<readonly SessionEvent[]> => {
   if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId)
   if (record.header.parentSession === undefined) return []
@@ -840,7 +923,7 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
  const currentLog = logs[currentIndex]
  if (currentIndex < 0 || currentLog === undefined) throw new Error('Current version not in version tree.')
  const turns = closedTurns(currentLog)
- return {
+ const result: MessageEditTimeline = {
   sessionId,
   messages: editableMessages(turns),
   retryableTurns: retryableTurns(turns),
@@ -848,6 +931,10 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   undoStack,
   redoSessionIds,
  }
+ if (cacheable) {
+  cacheTimeline(sessionId, timelineCacheKey(sessionId, lineage, currentLength), result)
+ }
+ return result
 }
 
 function objectValue(value: unknown): Record<string, unknown> {
@@ -938,14 +1025,23 @@ async function handleRoute(ctx: Context, request: HttpRequestLike, response: Htt
    return
   }
   if (request.method === 'POST') {
-   respondJson(response, 200, await runOperation(ctx, decodeOperation(await requestJson(request))))
+   const operation = decodeOperation(await requestJson(request))
+   const sourceId = sessionIdOf(operation.sessionId)
+   const result = await serializeSessionOperation(sourceId, () => runOperation(ctx, operation))
+   invalidateTimelineCache(sourceId)
+   if (result.sessionId !== sourceId) invalidateTimelineCache(result.sessionId)
+   respondJson(response, 200, result)
    return
   }
   response.writeHead(405)
   response.end()
  } catch (error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
-  respondJson(response, error instanceof TypeError ? 400 : 409, { error: message })
+  const busy = message.includes(AGENT_BUSY_MARKER)
+  respondJson(response, error instanceof TypeError ? 400 : 409, {
+   error: busy ? 'The assistant is still responding; wait for it to finish before editing.' : message,
+   ...busy ? { code: 'agent-busy' } : {},
+  })
  }
 }
 

@@ -159,7 +159,10 @@ window.__ModuleLoader__.load({
 				error: null,
 				pending: null,
 				timeline: null,
-				switchingTo: null
+				switchingTo: null,
+				busy: false,
+				regenerating: false,
+				optimisticEdit: null
 			});
 			face;
 			generation = 0;
@@ -402,9 +405,16 @@ window.__ModuleLoader__.load({
 				this.sessionSourceDispose?.();
 				this.sessionSource = source;
 				this.sessionRevision = source === void 0 ? void 0 : conversationRevision(source.getSnapshot());
+				if (source !== void 0) this.store.update((state) => {
+					state.busy = source.getSnapshot().running;
+				});
 				this.sessionSourceDispose = source?.subscribe(() => {
 					if (this.sessionSource !== source) return;
-					const revision = conversationRevision(source.getSnapshot());
+					const snapshot = source.getSnapshot();
+					this.store.update((state) => {
+						state.busy = snapshot.running;
+					});
+					const revision = conversationRevision(snapshot);
 					if (revision === this.sessionRevision) return;
 					this.sessionRevision = revision;
 					this.invalidate();
@@ -468,6 +478,12 @@ window.__ModuleLoader__.load({
 						state.status = "ready";
 						state.error = null;
 						state.timeline = timeline;
+						if (state.optimisticEdit !== null) {
+							if (timeline.messages.some((message) => message.turn === state.optimisticEdit?.turn)) {
+								state.optimisticEdit = null;
+								state.regenerating = false;
+							}
+						}
 					});
 				} catch (error) {
 					if (generation !== this.generation) return;
@@ -486,6 +502,12 @@ window.__ModuleLoader__.load({
 			async mutate(operation) {
 				const current = this.store.getSnapshot();
 				if (current.pending !== null || current.status !== "ready") return false;
+				if (current.busy || current.regenerating) {
+					this.store.update((state) => {
+						state.error = "The assistant is still responding; wait for it to finish before editing.";
+					});
+					return false;
+				}
 				this.store.update((state) => {
 					state.pending = operation.action;
 					state.error = null;
@@ -504,7 +526,18 @@ window.__ModuleLoader__.load({
 						state.pending = null;
 					});
 					if (result.sessionId === this.sessionId) {
-						this.refreshIfLoaded();
+						if (operation.action === "edit") {
+							const edit = operation;
+							const nextTurn = this.nextTurnAfterCurrent();
+							this.store.update((state) => {
+								state.optimisticEdit = {
+									turn: nextTurn,
+									eventSeq: edit.eventSeq,
+									text: edit.text
+								};
+								state.regenerating = true;
+							});
+						}
 						return true;
 					}
 					try {
@@ -523,10 +556,18 @@ window.__ModuleLoader__.load({
 					if (this.disposed) return false;
 					this.store.update((state) => {
 						state.pending = null;
+						state.regenerating = false;
+						state.optimisticEdit = null;
 						state.error = messageOf(error);
 					});
 					return false;
 				}
+			}
+			/** Next turn number the in-place regeneration will open. */
+			nextTurnAfterCurrent() {
+				const timeline = this.store.getSnapshot().timeline;
+				if (timeline === null) return 1;
+				return timeline.messages.reduce((max, message) => Math.max(max, message.turn), 0) + 1;
 			}
 			/** Session-list publication is the reactive dependency for navigation. */
 			openWhenListed(sessionId) {
@@ -569,14 +610,14 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var InlineMessageEdit_module_css_default = {
-			"overlay": "D60d8a_overlay",
+			"panel": "D60d8a_panel",
+			"picker": "D60d8a_picker",
 			"pickerItemActive": "D60d8a_pickerItemActive",
 			"title": "D60d8a_title",
+			"input": "D60d8a_input",
 			"iconButton": "D60d8a_iconButton",
 			"pickerItem": "D60d8a_pickerItem",
-			"panel": "D60d8a_panel",
-			"input": "D60d8a_input",
-			"picker": "D60d8a_picker",
+			"overlay": "D60d8a_overlay",
 			"footer": "D60d8a_footer"
 		};
 		//#endregion
@@ -870,10 +911,10 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditHeader_module_css_default = {
-			"iconButton": "EM6NxG_iconButton",
 			"root": "EM6NxG_root",
-			"rerollButton": "EM6NxG_rerollButton",
-			"counter": "EM6NxG_counter"
+			"counter": "EM6NxG_counter",
+			"iconButton": "EM6NxG_iconButton",
+			"rerollButton": "EM6NxG_rerollButton"
 		};
 		//#endregion
 		//#region src/client/MessageEditHeader.tsx
@@ -938,7 +979,7 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region \0dsh-css:/home/silini/tools/deepseek plugins/dsh-message-edit-enhanced/src/client/MessageEditTimelineView.module.css.mjs
-		const css = ".kxmlFa_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.kxmlFa_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.kxmlFa_title,.kxmlFa_intro,.kxmlFa_subtitle,.kxmlFa_notice,.kxmlFa_error,.kxmlFa_empty,.kxmlFa_turnTitle,.kxmlFa_turnPreview,.kxmlFa_messageText{margin:0}.kxmlFa_title{font-size:22px;font-weight:600;line-height:30px}.kxmlFa_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.kxmlFa_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.kxmlFa_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterSearch,.kxmlFa_filterChip{box-sizing:border-box;font:inherit}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_filterSearch{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.kxmlFa_select{height:34px;padding:0 30px 0 9px;font-size:12px}.kxmlFa_filterSearch{width:100%;height:32px;padding:0 10px;font-size:12px}.kxmlFa_filterSearch:focus{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterChip{cursor:pointer;border:0}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_filterChip{border-radius:14px;justify-content:center;align-items:center;min-height:28px;padding:0 10px;font-size:11px;line-height:18px;display:inline-flex}.kxmlFa_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.kxmlFa_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.kxmlFa_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.kxmlFa_secondaryButton:hover:not(:disabled),.kxmlFa_textButton:hover:not(:disabled),.kxmlFa_versionButton:hover:not(:disabled),.kxmlFa_filterChip:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.kxmlFa_primaryButton:disabled,.kxmlFa_secondaryButton:disabled,.kxmlFa_textButton:disabled,.kxmlFa_versionButton:disabled,.kxmlFa_filterChip:disabled,.kxmlFa_select:disabled,.kxmlFa_filterSearch:disabled{cursor:default;opacity:.45}.kxmlFa_primaryButton:focus-visible,.kxmlFa_secondaryButton:focus-visible,.kxmlFa_textButton:focus-visible,.kxmlFa_versionButton:focus-visible,.kxmlFa_filterChip:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_notice,.kxmlFa_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.kxmlFa_notice{color:var(--dsw-alias-state-warn-label)}.kxmlFa_error{color:var(--dsw-alias-state-error-primary)}.kxmlFa_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.kxmlFa_status .kxmlFa_error{margin:0}.kxmlFa_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.kxmlFa_versionsPanel,.kxmlFa_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.kxmlFa_versionsPanel{position:sticky;top:0}.kxmlFa_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.kxmlFa_filterBar{flex-direction:column;gap:8px;margin-bottom:12px;display:flex}.kxmlFa_filterChips{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_filterChip{color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);background:0 0;border-radius:12px;min-height:26px;padding:2px 8px;font-size:11px;line-height:18px}.kxmlFa_filterChip[data-active]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform)}.kxmlFa_turnFilterBar{margin-bottom:12px}.kxmlFa_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.kxmlFa_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.kxmlFa_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_effectButtons .kxmlFa_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.kxmlFa_subtitle{font-size:16px;font-weight:500;line-height:24px}.kxmlFa_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.kxmlFa_versionList,.kxmlFa_turnList{margin:0;padding:0;list-style:none}.kxmlFa_versionListScroller{min-height:120px;max-height:520px;overflow:auto}.kxmlFa_versionList{width:100%;position:relative}.kxmlFa_versionItem{--message-edit-enhanced-depth:0;padding-left:calc(var(--message-edit-enhanced-depth) * 14px);position:relative}.kxmlFa_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.kxmlFa_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.kxmlFa_versionButton:not([data-current]) .kxmlFa_pathBadge{opacity:.8}.kxmlFa_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.kxmlFa_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.kxmlFa_versionButton[data-current] .kxmlFa_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.kxmlFa_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.kxmlFa_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.kxmlFa_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.kxmlFa_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.kxmlFa_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.kxmlFa_currentBadge,.kxmlFa_pathBadge,.kxmlFa_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.kxmlFa_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_turnList{flex-direction:column;gap:14px;display:flex}.kxmlFa_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.kxmlFa_turnHeader,.kxmlFa_messageHeader,.kxmlFa_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.kxmlFa_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.kxmlFa_turnTitle{font-size:14px;font-weight:500;line-height:22px}.kxmlFa_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.kxmlFa_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.kxmlFa_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.kxmlFa_messageHeader{justify-content:flex-start}.kxmlFa_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.kxmlFa_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.kxmlFa_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.kxmlFa_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.kxmlFa_editor{margin-top:8px}.kxmlFa_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.kxmlFa_editorActions{margin-top:8px}.kxmlFa_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.kxmlFa_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}.kxmlFa_versionExpand{background:var(--dsw-alias-bg-module-hover);width:24px;height:24px;color:var(--dsw-alias-label-secondary);cursor:pointer;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;font-size:10px;line-height:1;display:flex}.kxmlFa_versionExpand:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kxmlFa_versionExpand:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionDiffPanel{background:var(--dsw-alias-bg-module-platform);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;margin-top:8px;padding:10px;animation:.15s ease-out kxmlFa_slideDown}@keyframes kxmlFa_slideDown{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.kxmlFa_versionDiffHeader{border-bottom:1px solid var(--dsw-alias-border-l2);margin-bottom:8px;padding-bottom:8px}.kxmlFa_diffLegend{color:var(--dsw-alias-label-tertiary);gap:12px;font-size:10px;display:flex}.kxmlFa_diffLegend span{border-radius:4px;padding:1px 6px}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary)}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary)}.kxmlFa_diffEqual{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary)}.kxmlFa_versionDiffContent{background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;word-wrap:break-word;border-radius:6px;max-height:300px;margin:0;padding:8px;font-family:inherit;font-size:12px;line-height:1.6;overflow:auto}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary);border-radius:2px;padding:0 2px;text-decoration:line-through}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary);border-radius:2px;padding:0 2px}.kxmlFa_diffEqual{color:var(--dsw-alias-label-secondary)}.kxmlFa_versionPin{width:26px;height:26px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:0 0;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;padding:0;font-size:14px;line-height:1;display:inline-flex}.kxmlFa_versionPin:hover{background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-brand-primary)}.kxmlFa_versionPin:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionTags{flex-wrap:wrap;gap:4px;margin-top:4px;display:inline-flex}.kxmlFa_versionTag{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-brand-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:1px 6px;font-size:10px;line-height:16px}.kxmlFa_versionNote{color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:11px;font-style:italic;line-height:16px;display:block}@media (width<=1000px){.kxmlFa_columns{grid-template-columns:1fr}.kxmlFa_versionsPanel{position:static}}@media (width<=680px){.kxmlFa_root{padding:16px}.kxmlFa_pageHeader,.kxmlFa_headerActions,.kxmlFa_turnHeader,.kxmlFa_editorActions{flex-direction:column;align-items:stretch}.kxmlFa_headerActions,.kxmlFa_primaryButton,.kxmlFa_secondaryButton{width:100%}}";
+		const css = ".kxmlFa_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.kxmlFa_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.kxmlFa_title,.kxmlFa_intro,.kxmlFa_subtitle,.kxmlFa_notice,.kxmlFa_error,.kxmlFa_empty,.kxmlFa_turnTitle,.kxmlFa_turnPreview,.kxmlFa_messageText{margin:0}.kxmlFa_title{font-size:22px;font-weight:600;line-height:30px}.kxmlFa_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.kxmlFa_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.kxmlFa_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterSearch,.kxmlFa_filterChip{box-sizing:border-box;font:inherit}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_filterSearch{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.kxmlFa_select{height:34px;padding:0 30px 0 9px;font-size:12px}.kxmlFa_filterSearch{width:100%;height:32px;padding:0 10px;font-size:12px}.kxmlFa_filterSearch:focus{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterChip{cursor:pointer;border:0}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_filterChip{border-radius:14px;justify-content:center;align-items:center;min-height:28px;padding:0 10px;font-size:11px;line-height:18px;display:inline-flex}.kxmlFa_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.kxmlFa_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.kxmlFa_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.kxmlFa_secondaryButton:hover:not(:disabled),.kxmlFa_textButton:hover:not(:disabled),.kxmlFa_versionButton:hover:not(:disabled),.kxmlFa_filterChip:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.kxmlFa_primaryButton:disabled,.kxmlFa_secondaryButton:disabled,.kxmlFa_textButton:disabled,.kxmlFa_versionButton:disabled,.kxmlFa_filterChip:disabled,.kxmlFa_select:disabled,.kxmlFa_filterSearch:disabled{cursor:default;opacity:.45}.kxmlFa_primaryButton:focus-visible,.kxmlFa_secondaryButton:focus-visible,.kxmlFa_textButton:focus-visible,.kxmlFa_versionButton:focus-visible,.kxmlFa_filterChip:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_notice,.kxmlFa_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.kxmlFa_notice{color:var(--dsw-alias-state-warn-label)}.kxmlFa_error{color:var(--dsw-alias-state-error-primary)}.kxmlFa_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.kxmlFa_status .kxmlFa_error{margin:0}.kxmlFa_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.kxmlFa_versionsPanel,.kxmlFa_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.kxmlFa_versionsPanel{position:sticky;top:0}.kxmlFa_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.kxmlFa_filterBar{flex-direction:column;gap:8px;margin-bottom:12px;display:flex}.kxmlFa_filterChips{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_filterChip{color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);background:0 0;border-radius:12px;min-height:26px;padding:2px 8px;font-size:11px;line-height:18px}.kxmlFa_filterChip[data-active]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform)}.kxmlFa_turnFilterBar{margin-bottom:12px}.kxmlFa_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.kxmlFa_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.kxmlFa_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_effectButtons .kxmlFa_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.kxmlFa_subtitle{font-size:16px;font-weight:500;line-height:24px}.kxmlFa_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.kxmlFa_versionList,.kxmlFa_turnList{margin:0;padding:0;list-style:none}.kxmlFa_versionListScroller{min-height:120px;max-height:520px;overflow:auto}.kxmlFa_versionList{width:100%;position:relative}.kxmlFa_versionItem{--message-edit-enhanced-depth:0;padding-left:calc(var(--message-edit-enhanced-depth) * 14px);position:relative}.kxmlFa_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.kxmlFa_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.kxmlFa_versionButton:not([data-current]) .kxmlFa_pathBadge{opacity:.8}.kxmlFa_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.kxmlFa_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.kxmlFa_versionButton[data-current] .kxmlFa_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.kxmlFa_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.kxmlFa_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.kxmlFa_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.kxmlFa_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.kxmlFa_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.kxmlFa_currentBadge,.kxmlFa_pathBadge,.kxmlFa_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.kxmlFa_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_turnList{flex-direction:column;gap:14px;display:flex}.kxmlFa_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.kxmlFa_turnHeader,.kxmlFa_messageHeader,.kxmlFa_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.kxmlFa_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.kxmlFa_turnTitle{font-size:14px;font-weight:500;line-height:22px}.kxmlFa_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.kxmlFa_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.kxmlFa_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.kxmlFa_messageHeader{justify-content:flex-start}.kxmlFa_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.kxmlFa_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.kxmlFa_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.kxmlFa_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.kxmlFa_editor{margin-top:8px}.kxmlFa_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.kxmlFa_editorActions{margin-top:8px}.kxmlFa_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.kxmlFa_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}.kxmlFa_versionExpand{background:var(--dsw-alias-bg-module-hover);width:24px;height:24px;color:var(--dsw-alias-label-secondary);cursor:pointer;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;font-size:10px;line-height:1;display:flex}.kxmlFa_versionExpand:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kxmlFa_versionExpand:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionDiffPanel{background:var(--dsw-alias-bg-module-platform);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;margin-top:8px;padding:10px;animation:.15s ease-out kxmlFa_slideDown}@keyframes kxmlFa_slideDown{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.kxmlFa_versionDiffHeader{border-bottom:1px solid var(--dsw-alias-border-l2);margin-bottom:8px;padding-bottom:8px}.kxmlFa_diffLegend{color:var(--dsw-alias-label-tertiary);gap:12px;font-size:10px;display:flex}.kxmlFa_diffLegend span{border-radius:4px;padding:1px 6px}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary)}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary)}.kxmlFa_diffEqual{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary)}.kxmlFa_versionDiffContent{background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;word-wrap:break-word;border-radius:6px;max-height:300px;margin:0;padding:8px;font-family:inherit;font-size:12px;line-height:1.6;overflow:auto}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary);border-radius:2px;padding:0 2px;text-decoration:line-through}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary);border-radius:2px;padding:0 2px}.kxmlFa_diffEqual{color:var(--dsw-alias-label-secondary)}.kxmlFa_versionPin{width:26px;height:26px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:0 0;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;padding:0;font-size:14px;line-height:1;display:inline-flex}.kxmlFa_versionPin:hover{background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-brand-primary)}.kxmlFa_versionPin:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionTags{flex-wrap:wrap;gap:4px;margin-top:4px;display:inline-flex}.kxmlFa_versionTag{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-brand-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:1px 6px;font-size:10px;line-height:16px}.kxmlFa_versionNote{color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:11px;font-style:italic;line-height:16px;display:block}@media (width<=1000px){.kxmlFa_columns{grid-template-columns:1fr}.kxmlFa_versionsPanel{position:static}}@media (width<=680px){.kxmlFa_root{padding:16px}.kxmlFa_pageHeader,.kxmlFa_headerActions,.kxmlFa_turnHeader,.kxmlFa_editorActions{flex-direction:column;align-items:stretch}.kxmlFa_headerActions,.kxmlFa_primaryButton,.kxmlFa_secondaryButton{width:100%}}.kxmlFa_optimisticMessage{background:var(--dsw-alias-bg-module-platform);border:1px dashed var(--dsw-alias-border-strong);border-radius:9px;flex-direction:column;gap:6px;padding:10px;display:flex}.kxmlFa_optimisticKind{color:var(--dsw-alias-label-secondary);font-size:12px}.kxmlFa_optimisticText{white-space:pre-wrap;overflow-wrap:anywhere}.kxmlFa_optimisticPulse{color:var(--dsw-alias-label-tertiary);align-self:flex-start;font-size:12px;animation:1.2s ease-in-out infinite kxmlFa_messageEditOptimisticPulse}@keyframes kxmlFa_messageEditOptimisticPulse{0%,to{opacity:.55}50%{opacity:1}}";
 		const tagId = "dsh-message-edit-enhanced/MessageEditTimelineView.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -948,74 +989,79 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditTimelineView_module_css_default = {
-			"versionExpand": "kxmlFa_versionExpand",
-			"filterChips": "kxmlFa_filterChips",
-			"primaryButton": "kxmlFa_primaryButton",
-			"root": "kxmlFa_root",
-			"versionMeta": "kxmlFa_versionMeta",
-			"turnSection": "kxmlFa_turnSection",
-			"editorHint": "kxmlFa_editorHint",
-			"versionPin": "kxmlFa_versionPin",
-			"headerActions": "kxmlFa_headerActions",
-			"filterBar": "kxmlFa_filterBar",
 			"versionItem": "kxmlFa_versionItem",
-			"turnTitle": "kxmlFa_turnTitle",
-			"textButton": "kxmlFa_textButton",
-			"columns": "kxmlFa_columns",
-			"effectButtons": "kxmlFa_effectButtons",
-			"effectControls": "kxmlFa_effectControls",
-			"diffDelete": "kxmlFa_diffDelete",
-			"turnFilterBar": "kxmlFa_turnFilterBar",
-			"select": "kxmlFa_select",
-			"sectionHeading": "kxmlFa_sectionHeading",
-			"subtitle": "kxmlFa_subtitle",
-			"count": "kxmlFa_count",
-			"versionLine": "kxmlFa_versionLine",
-			"versionDiff": "kxmlFa_versionDiff",
-			"versionListScroller": "kxmlFa_versionListScroller",
 			"status": "kxmlFa_status",
-			"notice": "kxmlFa_notice",
-			"filterChip": "kxmlFa_filterChip",
-			"versionDiffHeader": "kxmlFa_versionDiffHeader",
-			"empty": "kxmlFa_empty",
-			"diffInsert": "kxmlFa_diffInsert",
-			"versionDot": "kxmlFa_versionDot",
-			"turnHeader": "kxmlFa_turnHeader",
-			"textarea": "kxmlFa_textarea",
-			"versionsPanel": "kxmlFa_versionsPanel",
-			"turnsPanel": "kxmlFa_turnsPanel",
-			"error": "kxmlFa_error",
-			"turnList": "kxmlFa_turnList",
-			"versionList": "kxmlFa_versionList",
-			"versionDiffContent": "kxmlFa_versionDiffContent",
-			"versionDiffPanel": "kxmlFa_versionDiffPanel",
-			"messageHeader": "kxmlFa_messageHeader",
-			"intro": "kxmlFa_intro",
-			"versionMain": "kxmlFa_versionMain",
-			"editorActions": "kxmlFa_editorActions",
-			"kindBadge": "kxmlFa_kindBadge",
-			"versionTitle": "kxmlFa_versionTitle",
-			"messageList": "kxmlFa_messageList",
-			"title": "kxmlFa_title",
-			"versionButton": "kxmlFa_versionButton",
-			"secondaryButton": "kxmlFa_secondaryButton",
-			"filterSearch": "kxmlFa_filterSearch",
-			"versionTags": "kxmlFa_versionTags",
+			"turnFilterBar": "kxmlFa_turnFilterBar",
 			"diffLegend": "kxmlFa_diffLegend",
-			"effectDepth": "kxmlFa_effectDepth",
+			"versionDiffContent": "kxmlFa_versionDiffContent",
+			"headerActions": "kxmlFa_headerActions",
+			"turnHeader": "kxmlFa_turnHeader",
+			"versionListScroller": "kxmlFa_versionListScroller",
 			"versionTag": "kxmlFa_versionTag",
-			"currentBadge": "kxmlFa_currentBadge",
-			"messageCard": "kxmlFa_messageCard",
-			"editor": "kxmlFa_editor",
+			"columns": "kxmlFa_columns",
+			"title": "kxmlFa_title",
+			"root": "kxmlFa_root",
+			"primaryButton": "kxmlFa_primaryButton",
+			"versionDiff": "kxmlFa_versionDiff",
 			"messageTime": "kxmlFa_messageTime",
-			"pageHeader": "kxmlFa_pageHeader",
-			"diffEqual": "kxmlFa_diffEqual",
-			"messageText": "kxmlFa_messageText",
-			"turnPreview": "kxmlFa_turnPreview",
-			"slideDown": "kxmlFa_slideDown",
-			"versionNote": "kxmlFa_versionNote",
 			"cascadeField": "kxmlFa_cascadeField",
-			"pathBadge": "kxmlFa_pathBadge"
+			"subtitle": "kxmlFa_subtitle",
+			"pageHeader": "kxmlFa_pageHeader",
+			"effectControls": "kxmlFa_effectControls",
+			"empty": "kxmlFa_empty",
+			"turnSection": "kxmlFa_turnSection",
+			"secondaryButton": "kxmlFa_secondaryButton",
+			"versionButton": "kxmlFa_versionButton",
+			"versionsPanel": "kxmlFa_versionsPanel",
+			"versionNote": "kxmlFa_versionNote",
+			"currentBadge": "kxmlFa_currentBadge",
+			"textButton": "kxmlFa_textButton",
+			"optimisticText": "kxmlFa_optimisticText",
+			"sectionHeading": "kxmlFa_sectionHeading",
+			"diffDelete": "kxmlFa_diffDelete",
+			"error": "kxmlFa_error",
+			"versionDiffHeader": "kxmlFa_versionDiffHeader",
+			"effectDepth": "kxmlFa_effectDepth",
+			"turnList": "kxmlFa_turnList",
+			"versionDiffPanel": "kxmlFa_versionDiffPanel",
+			"diffEqual": "kxmlFa_diffEqual",
+			"versionMeta": "kxmlFa_versionMeta",
+			"optimisticKind": "kxmlFa_optimisticKind",
+			"versionLine": "kxmlFa_versionLine",
+			"editorHint": "kxmlFa_editorHint",
+			"editorActions": "kxmlFa_editorActions",
+			"versionList": "kxmlFa_versionList",
+			"textarea": "kxmlFa_textarea",
+			"effectButtons": "kxmlFa_effectButtons",
+			"turnPreview": "kxmlFa_turnPreview",
+			"versionDot": "kxmlFa_versionDot",
+			"slideDown": "kxmlFa_slideDown",
+			"intro": "kxmlFa_intro",
+			"notice": "kxmlFa_notice",
+			"count": "kxmlFa_count",
+			"editor": "kxmlFa_editor",
+			"messageCard": "kxmlFa_messageCard",
+			"optimisticMessage": "kxmlFa_optimisticMessage",
+			"optimisticPulse": "kxmlFa_optimisticPulse",
+			"filterSearch": "kxmlFa_filterSearch",
+			"filterChip": "kxmlFa_filterChip",
+			"messageList": "kxmlFa_messageList",
+			"versionPin": "kxmlFa_versionPin",
+			"versionTitle": "kxmlFa_versionTitle",
+			"pathBadge": "kxmlFa_pathBadge",
+			"kindBadge": "kxmlFa_kindBadge",
+			"select": "kxmlFa_select",
+			"diffInsert": "kxmlFa_diffInsert",
+			"versionTags": "kxmlFa_versionTags",
+			"messageText": "kxmlFa_messageText",
+			"turnsPanel": "kxmlFa_turnsPanel",
+			"versionExpand": "kxmlFa_versionExpand",
+			"versionMain": "kxmlFa_versionMain",
+			"filterChips": "kxmlFa_filterChips",
+			"turnTitle": "kxmlFa_turnTitle",
+			"messageHeader": "kxmlFa_messageHeader",
+			"filterBar": "kxmlFa_filterBar",
+			"messageEditOptimisticPulse": "kxmlFa_messageEditOptimisticPulse"
 		};
 		//#endregion
 		//#region src/client/MessageEditTimelineView.tsx
@@ -1368,7 +1414,7 @@ window.__ModuleLoader__.load({
 			}, [acquire, load]);
 			const timeline = state.timeline;
 			const sections = (0, react.useMemo)(() => timeline === null ? [] : turnSections(timeline.retryableTurns, timeline.messages), [timeline]);
-			const busy = state.pending !== null || state.status !== "ready";
+			const busy = state.pending !== null || state.status !== "ready" || state.busy;
 			(0, react.useEffect)(() => {
 				setEditing((current) => {
 					if (current === null || timeline === null) return current;
@@ -1506,6 +1552,11 @@ window.__ModuleLoader__.load({
 					state.switchingTo !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
 						className: MessageEditTimelineView_module_css_default["notice"],
 						children: ["Switching session… ", /* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: state.switchingTo.slice(0, 12) })]
+					}) : null,
+					state.regenerating ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: MessageEditTimelineView_module_css_default["notice"],
+						role: "status",
+						children: "Regenerating response in the current session…"
 					}) : null,
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: MessageEditTimelineView_module_css_default["columns"],
@@ -1673,12 +1724,12 @@ window.__ModuleLoader__.load({
 										}
 									})
 								}),
-								filteredSections.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								filteredSections.length === 0 && state.optimisticEdit === null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
 									className: MessageEditTimelineView_module_css_default["empty"],
 									children: "No settled turns available to edit in this session."
-								}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ol", {
+								}) : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("ol", {
 									className: MessageEditTimelineView_module_css_default["turnList"],
-									children: filteredSections.map((section) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
+									children: [filteredSections.map((section) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
 										className: MessageEditTimelineView_module_css_default["turnSection"],
 										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 											className: MessageEditTimelineView_module_css_default["turnHeader"],
@@ -1722,7 +1773,40 @@ window.__ModuleLoader__.load({
 												onApplyEdit: applyEdit
 											}, message.key))
 										})]
-									}, section.retry.turn))
+									}, section.retry.turn)), state.optimisticEdit === null ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
+										className: MessageEditTimelineView_module_css_default["turnSection"],
+										"data-optimistic": "true",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: MessageEditTimelineView_module_css_default["turnHeader"],
+											children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("h3", {
+												className: MessageEditTimelineView_module_css_default["turnTitle"],
+												children: ["Turn ", String(state.optimisticEdit.turn)]
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+												className: MessageEditTimelineView_module_css_default["turnPreview"],
+												children: "Regenerating in the current session…"
+											})] })
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: MessageEditTimelineView_module_css_default["messageList"],
+											children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: MessageEditTimelineView_module_css_default["optimisticMessage"],
+												children: [
+													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: MessageEditTimelineView_module_css_default["optimisticKind"],
+														children: "User"
+													}),
+													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: MessageEditTimelineView_module_css_default["optimisticText"],
+														children: state.optimisticEdit.text || "(empty)"
+													}),
+													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: MessageEditTimelineView_module_css_default["optimisticPulse"],
+														role: "status",
+														children: "regenerating"
+													})
+												]
+											})
+										})]
+									})]
 								})
 							]
 						})]

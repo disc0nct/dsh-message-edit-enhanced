@@ -32,6 +32,12 @@ export interface MessageEditState {
   pending: VersionOperation | null
   timeline: MessageEditTimeline | null
   switchingTo: string | null
+  /** The session's agent is streaming a response; mutations are rejected. */
+  busy: boolean
+  /** An in-place edit is queued and the regenerated turn has not landed yet. */
+  regenerating: boolean
+  /** Optimistic edited-message preview for an in-flight in-place edit. */
+  optimisticEdit: { turn: number; eventSeq: number; text: string } | null
 }
 
 /** Merge a burst of turn completions into one refresh. */
@@ -237,6 +243,9 @@ export class MessageEditController {
     pending: null,
     timeline: null,
     switchingTo: null,
+    busy: false,
+    regenerating: false,
+    optimisticEdit: null,
   })
 
   readonly face: MessageEditFace
@@ -499,9 +508,14 @@ export class MessageEditController {
     this.sessionSourceDispose?.()
     this.sessionSource = source
     this.sessionRevision = source === undefined ? undefined : conversationRevision(source.getSnapshot())
+    if (source !== undefined) {
+      this.store.update((state) => { state.busy = source.getSnapshot().running })
+    }
     this.sessionSourceDispose = source?.subscribe(() => {
       if (this.sessionSource !== source) return
-      const revision = conversationRevision(source.getSnapshot())
+      const snapshot = source.getSnapshot()
+      this.store.update((state) => { state.busy = snapshot.running })
+      const revision = conversationRevision(snapshot)
       if (revision === this.sessionRevision) return
       this.sessionRevision = revision
       this.invalidate()
@@ -570,6 +584,15 @@ export class MessageEditController {
         state.status = 'ready'
         state.error = null
         state.timeline = timeline
+        // The in-place regenerated turn has landed (its edited user message is
+        // now a settled turn in the projection), so retire the optimistic stub.
+        if (state.optimisticEdit !== null) {
+          const landed = timeline.messages.some(message => message.turn === state.optimisticEdit?.turn)
+          if (landed) {
+            state.optimisticEdit = null
+            state.regenerating = false
+          }
+        }
       })
     } catch (error) {
       if (generation !== this.generation) return
@@ -590,6 +613,15 @@ export class MessageEditController {
   private async mutate(operation: MessageEditOperation): Promise<boolean> {
     const current = this.store.getSnapshot()
     if (current.pending !== null || current.status !== 'ready') return false
+    if (current.busy || current.regenerating) {
+      // The agent is streaming (or an in-place regeneration is in flight);
+      // runMaintenance would reject the work with an opaque error, so reject
+      // up-front with a clear message.
+      this.store.update((state) => {
+        state.error = 'The assistant is still responding; wait for it to finish before editing.'
+      })
+      return false
+    }
     this.store.update((state) => {
       state.pending = operation.action
       state.error = null
@@ -607,11 +639,18 @@ export class MessageEditController {
       if (this.disposed) return true
       this.store.update((state) => { state.pending = null })
       if (result.sessionId === this.sessionId) {
-        // In-place edit: the host truncated and re-sent in the CURRENT session,
-        // so there is nothing to navigate to and no branch stub to insert. The
-        // session-event subscription refreshes the timeline as the regenerated
-        // response streams in.
-        this.refreshIfLoaded()
+        // In-place edit: the host truncated and re-sent in the CURRENT session.
+        // No navigation and no branch stub. Show an optimistic edited-message
+        // preview immediately; the session-event subscription refreshes the
+        // timeline when the regenerated turn lands (one refresh, no double GET).
+        if (operation.action === 'edit') {
+          const edit = operation as EditOperation
+          const nextTurn = this.nextTurnAfterCurrent()
+          this.store.update((state) => {
+            state.optimisticEdit = { turn: nextTurn, eventSeq: edit.eventSeq, text: edit.text }
+            state.regenerating = true
+          })
+        }
         return true
       }
       try {
@@ -626,10 +665,20 @@ export class MessageEditController {
       if (this.disposed) return false
       this.store.update((state) => {
         state.pending = null
+        state.regenerating = false
+        state.optimisticEdit = null
         state.error = messageOf(error)
       })
       return false
     }
+  }
+
+  /** Next turn number the in-place regeneration will open. */
+  private nextTurnAfterCurrent(): number {
+    const timeline = this.store.getSnapshot().timeline
+    if (timeline === null) return 1
+    const last = timeline.messages.reduce((max, message) => Math.max(max, message.turn), 0)
+    return last + 1
   }
 
   /** Session-list publication is the reactive dependency for navigation. */

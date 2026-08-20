@@ -763,3 +763,36 @@
     width: 100%;
   }
 }
+
+/* In-place regeneration optimistic stub */
+.optimisticMessage {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: 9px;
+  padding: 10px;
+  background: var(--dsw-alias-bg-module-platform);
+  border: 1px dashed var(--dsw-alias-border-strong);
+}
+
+.optimisticKind {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+}
+
+.optimisticText {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.optimisticPulse {
+  align-self: flex-start;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  animation: messageEditOptimisticPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes messageEditOptimisticPulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}

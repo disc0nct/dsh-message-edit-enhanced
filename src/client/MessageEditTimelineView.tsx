@@ -425,7 +425,7 @@ export function MessageEditTimelineView({
     () => timeline === null ? [] : turnSections(timeline.retryableTurns, timeline.messages),
     [timeline],
   )
-  const busy = state.pending !== null || state.status !== 'ready'
+  const busy = state.pending !== null || state.status !== 'ready' || state.busy
 
   useEffect(() => {
     setEditing((current) => {
@@ -545,6 +545,11 @@ export function MessageEditTimelineView({
       {state.switchingTo !== null ? (
         <p className={styles['notice']}>
           Switching session… <code>{state.switchingTo.slice(0, 12)}</code>
+        </p>
+      ) : null}
+      {state.regenerating ? (
+        <p className={styles['notice']} role="status">
+          Regenerating response in the current session…
         </p>
       ) : null}
 
@@ -675,7 +680,7 @@ export function MessageEditTimelineView({
             />
           </div>
 
-          {filteredSections.length === 0
+          {filteredSections.length === 0 && state.optimisticEdit === null
             ? <p className={styles['empty']}>No settled turns available to edit in this session.</p>
             : (
               <ol className={styles['turnList']}>
@@ -714,6 +719,23 @@ export function MessageEditTimelineView({
                     </div>
                   </li>
                 ))}
+                {state.optimisticEdit === null ? null : (
+                  <li className={styles['turnSection']} data-optimistic="true">
+                    <div className={styles['turnHeader']}>
+                      <div>
+                        <h3 className={styles['turnTitle']}>Turn {String(state.optimisticEdit.turn)}</h3>
+                        <p className={styles['turnPreview']}>Regenerating in the current session…</p>
+                      </div>
+                    </div>
+                    <div className={styles['messageList']}>
+                      <div className={styles['optimisticMessage']}>
+                        <span className={styles['optimisticKind']}>User</span>
+                        <span className={styles['optimisticText']}>{state.optimisticEdit.text || '(empty)'}</span>
+                        <span className={styles['optimisticPulse']} role="status">regenerating</span>
+                      </div>
+                    </div>
+                  </li>
+                )}
               </ol>
             )}
         </main>

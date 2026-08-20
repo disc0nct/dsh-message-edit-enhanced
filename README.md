@@ -51,6 +51,15 @@ This path does not touch `ReactLoopAgent`, AgentLoop private methods, or apiprox
 - Timeline and header share a value-level Snapshot source keyed by `sessionId`; the controller reactively subscribes to the current Session's closed turn values and the lineage values in the Session list, rebinding when the Session identity is replaced without caching the old Session object.
 - New version navigation waits for the runtime Session list to publish the corresponding ID before executing `ctx.sessions.open()`, with availability changes directly driving navigation.
 
+## Stability & Performance
+
+- **Busy-agent guard**: edit/retry/reroll buttons disable while the session's agent is streaming; the host also maps `runMaintenance`'s "already has active work" to a typed `409 agent-busy` with a friendly message.
+- **Per-session serialization**: operations against the same source session run one at a time (FIFO), so concurrent edits/rerolls/retries can never race `runMaintenance`.
+- **Truncation atomicity**: in-place edits queue the regeneration (`followup`) *before* flushing; a failed flush is logged but never strands a truncated surface without a queued response.
+- **Live-agent requirement**: in-place edits only run against a live agent; otherwise the operation falls back to the fork path — no resumed-agent leak.
+- **Revision-keyed timeline cache**: the value-level projection is cached per lineage+event signature (5s TTL) and invalidated on POST, cutting redundant GETs during streaming.
+- **Optimistic in-place stub**: after editing a user message, the timeline shows the edited text with a "regenerating" pulse immediately; the stub retires when the regenerated turn lands.
+
 ## Data Model
 
 Each plugin version contains a `message-edit-enhanced/version` event in its own non-inherited suffix:
