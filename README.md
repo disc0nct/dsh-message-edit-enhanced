@@ -4,10 +4,10 @@
 [![npm downloads](https://img.shields.io/npm/dm/dsh-message-edit)](https://www.npmjs.com/package/dsh-message-edit)
 [![license](https://img.shields.io/npm/l/dsh-message-edit)](LICENSE)
 
-`dsh-message-edit` ([npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/Moeblack/dsh-message-edit)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
+`dsh-message-edit` ([npm](https://www.npmjs.com/package/dsh-message-edit) · [GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
 
 ```bash
-dsh plugin --profile web add dsh-message-edit
+dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhanced
 ```
 
 ## Features
@@ -105,7 +105,7 @@ The build is based on `@deepseek-ai/*@0.1.0-rc.6` types published to npm and the
 ## Installation
 
 ```bash
-dsh plugin --profile web add dsh-message-edit
+dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhanced
 ```
 
 Or for local development:
