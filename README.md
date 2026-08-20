@@ -2,7 +2,7 @@
 
 [![license](https://img.shields.io/github/license/disc0nct/dsh-message-edit-enhanced)](LICENSE)
 
-`dsh-message-edit-enhanced` ([GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine; every edit, reroll, or retry forks a new session version from before the target turn, while the original session is preserved and can be restored at any time.
+`dsh-message-edit-enhanced` ([GitHub](https://github.com/disc0nct/dsh-message-edit-enhanced)) adds event-sourced **message editing and regeneration** to DeepSeek Harness. The plugin never rewrites historical events nor patches the DSH engine. **Editing a user message truncates the conversation at that message and regenerates the response in the current session** (ChatGPT-style, no fork); assistant-block edits, rerolls, and retries fork a new session version from before the target turn, while the original session is preserved and can be restored at any time.
 
 ```bash
 dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhanced
@@ -11,6 +11,8 @@ dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhance
 ## Features
 
 - **Edit Messages**: Edit settled user text, `assistant.reasoning` thinking blocks, and `assistant.response` reply text.
+ - Editing a **user** message truncates the model context at that message and regenerates the reply **in the current session** — the edited message is re-sent and the assistant responds without creating a new branch.
+ - Editing an `assistant.reasoning`/`assistant.response` block still forks a new version branch (the reply is replaced at the source).
 - **Regenerate**: Fork from before the last settled assistant reply's turn and regenerate using the original user input.
 - **Retry Any Turn**: Select any historical turn in the Timeline to re-execute it.
 - **Cascade Policies**:
@@ -25,10 +27,11 @@ dsh plugin --profile <your-profile> add github:disc0nct/dsh-message-edit-enhance
 
 The plugin treats a **complete turn** as the atomic effect. The target turn's `turn/start`, model request, tool calls, tool results, and `turn/end` are never spliced by copying parts locally; the new version branches from the closed boundary before that turn:
 
-1. User message edit, Reroll, and Retry: roll back the entire target turn, then submit the target user input as a new turn to the Agent.
-2. Assistant block edit: roll back the entire target turn, construct a new fully closed turn from the original user input plus the edited assistant content; the original tool chain does not carry into the new version. When `preserve` is selected, subsequent user inputs are then submitted to the Agent sequentially, producing a new complete tool chain.
-3. Each version appends an indivisible `message-edit-enhanced/version` effect pair: `effect` records the forward effect, `inverse` records the restore target. The parent version chain automatically derives the combined inverse; restoration does not delete events but switches to another existing version along the inverse chain.
-4. Message history transforms do not commute, so undo follows LIFO: only the current atomic effect is undone while keeping earlier effects; all successor branches remain and can be re-applied from the parent version.
+1. **User message edit (in-place, no fork)**: the session surface is truncated at the edited message with an empty `assistant/message` replacement node (`surfaceOp: { op: 'replace', start, end }`, `sourceEventSeqs` covering every shadowed node). The empty replacement derives no message, so the model context restarts at the edited user input while the human transcript keeps the shadowed history above (append-only, same as compaction). The edited message is then re-sent via `agent.followup()` inside the source agent's `runMaintenance()`; the loop's wake latches behind maintenance and regenerates the reply in the **same session** with the full engine machinery (system prompt, tools, streaming, tool calls).
+2. Reroll and Retry: roll back the entire target turn, then submit the target user input as a new turn to the Agent (fork).
+3. Assistant block edit: fork; roll back the entire target turn, construct a new fully closed turn from the original user input plus the edited assistant content; the original tool chain does not carry into the new version. When `preserve` is selected, subsequent user inputs are then submitted to the Agent sequentially, producing a new complete tool chain.
+4. Each forked version appends an indivisible `message-edit-enhanced/version` effect pair: `effect` records the forward effect, `inverse` records the restore target. The parent version chain automatically derives the combined inverse; restoration does not delete events but switches to another existing version along the inverse chain. In-place edits record **no** version event — the version tree is unchanged and the current session simply gains the regenerated turn.
+5. Message history transforms do not commute, so undo follows LIFO: only the current atomic effect is undone while keeping earlier effects; all successor branches remain and can be re-applied from the parent version.
 
 ### Branching and Agent Wiring
 
@@ -117,7 +120,7 @@ dsh plugin --profile web add -w link:/path/to/dsh-message-edit-enhanced
 ## HTTP API
 
 - `GET /message-edit-enhanced?sessionId=<id>`: Read editable messages, retryable turns, and the complete version tree.
-- `POST /message-edit-enhanced`: Execute `edit`, `reroll`, or `retry` and return the newly published Session ID.
+- `POST /message-edit-enhanced`: Execute `edit`, `reroll`, or `retry`. For a user-message edit the returned `sessionId` is the **same** session (regenerated in place); for assistant-block edits, rerolls, and retries it is the newly published branch Session ID.
 
 ## Scope Boundaries
 

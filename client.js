@@ -503,6 +503,10 @@ window.__ModuleLoader__.load({
 					this.store.update((state) => {
 						state.pending = null;
 					});
+					if (result.sessionId === this.sessionId) {
+						this.refreshIfLoaded();
+						return true;
+					}
 					try {
 						this.store.update((state) => {
 							state.switchingTo = result.sessionId;
@@ -565,15 +569,15 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var InlineMessageEdit_module_css_default = {
-			"pickerItem": "D60d8a_pickerItem",
 			"overlay": "D60d8a_overlay",
-			"panel": "D60d8a_panel",
-			"footer": "D60d8a_footer",
-			"title": "D60d8a_title",
 			"pickerItemActive": "D60d8a_pickerItemActive",
+			"title": "D60d8a_title",
 			"iconButton": "D60d8a_iconButton",
+			"pickerItem": "D60d8a_pickerItem",
+			"panel": "D60d8a_panel",
 			"input": "D60d8a_input",
-			"picker": "D60d8a_picker"
+			"picker": "D60d8a_picker",
+			"footer": "D60d8a_footer"
 		};
 		//#endregion
 		//#region src/client/InlineMessageEdit.tsx
@@ -866,10 +870,10 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditHeader_module_css_default = {
-			"counter": "EM6NxG_counter",
+			"iconButton": "EM6NxG_iconButton",
 			"root": "EM6NxG_root",
 			"rerollButton": "EM6NxG_rerollButton",
-			"iconButton": "EM6NxG_iconButton"
+			"counter": "EM6NxG_counter"
 		};
 		//#endregion
 		//#region src/client/MessageEditHeader.tsx
@@ -944,74 +948,74 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditTimelineView_module_css_default = {
-			"pageHeader": "kxmlFa_pageHeader",
-			"subtitle": "kxmlFa_subtitle",
-			"effectButtons": "kxmlFa_effectButtons",
-			"versionTitle": "kxmlFa_versionTitle",
-			"turnHeader": "kxmlFa_turnHeader",
-			"editorActions": "kxmlFa_editorActions",
-			"versionDiffContent": "kxmlFa_versionDiffContent",
-			"diffLegend": "kxmlFa_diffLegend",
-			"notice": "kxmlFa_notice",
+			"versionExpand": "kxmlFa_versionExpand",
 			"filterChips": "kxmlFa_filterChips",
+			"primaryButton": "kxmlFa_primaryButton",
+			"root": "kxmlFa_root",
+			"versionMeta": "kxmlFa_versionMeta",
+			"turnSection": "kxmlFa_turnSection",
+			"editorHint": "kxmlFa_editorHint",
+			"versionPin": "kxmlFa_versionPin",
+			"headerActions": "kxmlFa_headerActions",
+			"filterBar": "kxmlFa_filterBar",
+			"versionItem": "kxmlFa_versionItem",
+			"turnTitle": "kxmlFa_turnTitle",
+			"textButton": "kxmlFa_textButton",
+			"columns": "kxmlFa_columns",
+			"effectButtons": "kxmlFa_effectButtons",
 			"effectControls": "kxmlFa_effectControls",
 			"diffDelete": "kxmlFa_diffDelete",
-			"diffEqual": "kxmlFa_diffEqual",
-			"columns": "kxmlFa_columns",
+			"turnFilterBar": "kxmlFa_turnFilterBar",
+			"select": "kxmlFa_select",
 			"sectionHeading": "kxmlFa_sectionHeading",
-			"versionDiffHeader": "kxmlFa_versionDiffHeader",
-			"cascadeField": "kxmlFa_cascadeField",
+			"subtitle": "kxmlFa_subtitle",
+			"count": "kxmlFa_count",
+			"versionLine": "kxmlFa_versionLine",
+			"versionDiff": "kxmlFa_versionDiff",
 			"versionListScroller": "kxmlFa_versionListScroller",
+			"status": "kxmlFa_status",
+			"notice": "kxmlFa_notice",
+			"filterChip": "kxmlFa_filterChip",
+			"versionDiffHeader": "kxmlFa_versionDiffHeader",
+			"empty": "kxmlFa_empty",
+			"diffInsert": "kxmlFa_diffInsert",
+			"versionDot": "kxmlFa_versionDot",
+			"turnHeader": "kxmlFa_turnHeader",
+			"textarea": "kxmlFa_textarea",
+			"versionsPanel": "kxmlFa_versionsPanel",
+			"turnsPanel": "kxmlFa_turnsPanel",
+			"error": "kxmlFa_error",
 			"turnList": "kxmlFa_turnList",
-			"versionMeta": "kxmlFa_versionMeta",
+			"versionList": "kxmlFa_versionList",
+			"versionDiffContent": "kxmlFa_versionDiffContent",
+			"versionDiffPanel": "kxmlFa_versionDiffPanel",
+			"messageHeader": "kxmlFa_messageHeader",
+			"intro": "kxmlFa_intro",
+			"versionMain": "kxmlFa_versionMain",
+			"editorActions": "kxmlFa_editorActions",
+			"kindBadge": "kxmlFa_kindBadge",
+			"versionTitle": "kxmlFa_versionTitle",
+			"messageList": "kxmlFa_messageList",
+			"title": "kxmlFa_title",
+			"versionButton": "kxmlFa_versionButton",
+			"secondaryButton": "kxmlFa_secondaryButton",
+			"filterSearch": "kxmlFa_filterSearch",
+			"versionTags": "kxmlFa_versionTags",
+			"diffLegend": "kxmlFa_diffLegend",
+			"effectDepth": "kxmlFa_effectDepth",
+			"versionTag": "kxmlFa_versionTag",
+			"currentBadge": "kxmlFa_currentBadge",
+			"messageCard": "kxmlFa_messageCard",
+			"editor": "kxmlFa_editor",
+			"messageTime": "kxmlFa_messageTime",
+			"pageHeader": "kxmlFa_pageHeader",
+			"diffEqual": "kxmlFa_diffEqual",
+			"messageText": "kxmlFa_messageText",
+			"turnPreview": "kxmlFa_turnPreview",
 			"slideDown": "kxmlFa_slideDown",
 			"versionNote": "kxmlFa_versionNote",
-			"versionItem": "kxmlFa_versionItem",
-			"secondaryButton": "kxmlFa_secondaryButton",
-			"turnTitle": "kxmlFa_turnTitle",
-			"versionMain": "kxmlFa_versionMain",
-			"headerActions": "kxmlFa_headerActions",
-			"messageHeader": "kxmlFa_messageHeader",
-			"versionButton": "kxmlFa_versionButton",
-			"textButton": "kxmlFa_textButton",
-			"versionTag": "kxmlFa_versionTag",
-			"versionDiffPanel": "kxmlFa_versionDiffPanel",
-			"primaryButton": "kxmlFa_primaryButton",
-			"filterSearch": "kxmlFa_filterSearch",
-			"versionExpand": "kxmlFa_versionExpand",
-			"messageList": "kxmlFa_messageList",
-			"editorHint": "kxmlFa_editorHint",
-			"versionLine": "kxmlFa_versionLine",
-			"messageText": "kxmlFa_messageText",
-			"select": "kxmlFa_select",
-			"versionList": "kxmlFa_versionList",
-			"title": "kxmlFa_title",
-			"versionsPanel": "kxmlFa_versionsPanel",
-			"messageTime": "kxmlFa_messageTime",
-			"editor": "kxmlFa_editor",
-			"empty": "kxmlFa_empty",
-			"intro": "kxmlFa_intro",
-			"versionDiff": "kxmlFa_versionDiff",
-			"diffInsert": "kxmlFa_diffInsert",
-			"turnPreview": "kxmlFa_turnPreview",
-			"count": "kxmlFa_count",
-			"filterChip": "kxmlFa_filterChip",
-			"currentBadge": "kxmlFa_currentBadge",
-			"kindBadge": "kxmlFa_kindBadge",
-			"versionDot": "kxmlFa_versionDot",
-			"error": "kxmlFa_error",
-			"root": "kxmlFa_root",
-			"textarea": "kxmlFa_textarea",
-			"effectDepth": "kxmlFa_effectDepth",
-			"versionPin": "kxmlFa_versionPin",
-			"pathBadge": "kxmlFa_pathBadge",
-			"turnSection": "kxmlFa_turnSection",
-			"status": "kxmlFa_status",
-			"turnFilterBar": "kxmlFa_turnFilterBar",
-			"messageCard": "kxmlFa_messageCard",
-			"versionTags": "kxmlFa_versionTags",
-			"turnsPanel": "kxmlFa_turnsPanel",
-			"filterBar": "kxmlFa_filterBar"
+			"cascadeField": "kxmlFa_cascadeField",
+			"pathBadge": "kxmlFa_pathBadge"
 		};
 		//#endregion
 		//#region src/client/MessageEditTimelineView.tsx

@@ -245,7 +245,7 @@ function agentOptions(events, fallback) {
 		...maxTokens === void 0 ? {} : { maxTokens }
 	};
 }
-async function withSourceAgent(ctx, sessionId, operation) {
+async function withSourceAgent(ctx, sessionId, operation, keepAlive = false) {
 	let handle;
 	let agent = ctx.agents.get(sessionId);
 	if (agent === void 0) {
@@ -259,7 +259,7 @@ async function withSourceAgent(ctx, sessionId, operation) {
 	try {
 		return await agent.runMaintenance(async () => operation(agent));
 	} finally {
-		await handle?.dispose();
+		if (!keepAlive) await handle?.dispose();
 	}
 }
 function inheritedSeed(source, boundary) {
@@ -374,37 +374,95 @@ async function recoverOperation(inverses) {
 	}
 	if (failures.length > 0) throw new AggregateError(failures, "Failed to recover version operation.");
 }
+async function runInPlaceEdit(ctx, source, operation) {
+	const session = source.session;
+	const events = session.events;
+	const turns = closedTurns(events);
+	const turn = turns[turns.findIndex((turn) => operation.eventSeq > turn.startSeq && operation.eventSeq < turn.endSeq)];
+	if (turn === void 0) throw new Error("Selected message does not belong to a settled turn.");
+	const target = turn.user?.seq === operation.eventSeq ? turn.user : void 0;
+	if (target?.type !== "user/message") throw new Error("In-place edit requires a user message.");
+	if (target.data.content[operation.blockIndex]?.type !== "text") throw new Error("Selected user message block is not text.");
+	const edited = cloneUser(target.data, replaceTextBlock(target.data.content, operation.blockIndex, operation.text));
+	const nodes = session.surface.nodes;
+	const startIdx = nodes.indexOf(operation.eventSeq);
+	if (startIdx === -1) throw new Error("Target message is no longer on the conversation surface.");
+	const shadowed = nodes.slice(startIdx);
+	const start = shadowed[0];
+	const end = shadowed[shadowed.length - 1];
+	if (start === void 0 || end === void 0) throw new Error("Target message has no surface span to truncate.");
+	const options = agentOptions(events, source.options);
+	const provider = options.provider;
+	const model = options.model;
+	if (provider === void 0 || model === void 0) throw new Error("Unable to resolve model route for in-place edit.");
+	const nextTurn = (turns.at(-1)?.turn ?? 0) + 1;
+	const emptyMessage = Object.freeze({
+		id: crypto.randomUUID(),
+		role: "assistant",
+		content: Object.freeze([]),
+		source: Object.freeze({
+			kind: "model",
+			provider,
+			model
+		})
+	});
+	session.append("assistant/message", {
+		turn: nextTurn,
+		step: 1,
+		message: emptyMessage
+	}, {
+		surfaceOp: {
+			op: "replace",
+			start,
+			end
+		},
+		sourceEventSeqs: [...shadowed]
+	});
+	await ctx.sessions.flush(session);
+	source.followup(edited);
+	return {
+		sessionId: session.id,
+		queuedTurns: 1
+	};
+}
+async function runForkOperation(ctx, source, sourceId, events, operation) {
+	const childId = sessionIdOf(`session-${crypto.randomUUID()}`);
+	const inverses = [];
+	try {
+		const plan = planOperation(operation, events);
+		const options = agentOptions(events, source.options);
+		const child = await createVersionAgent(ctx, source.session, childId, plan, options);
+		inverses.push(() => child.dispose());
+		const workspace = sourceWorkspace(ctx, sourceId);
+		if (workspace !== void 0) {
+			await workspace.attachSession(childId);
+			inverses.push(() => workspace.detachSession(childId));
+		}
+		for (const message of plan.queuedUsers) child.agent.followup(message);
+		inverses.length = 0;
+		return {
+			sessionId: childId,
+			queuedTurns: plan.queuedUsers.length
+		};
+	} catch (error) {
+		try {
+			await recoverOperation(inverses);
+		} catch (recoveryError) {
+			throw new AggregateError([error, recoveryError], "Version operation and its recovery both failed.");
+		}
+		throw error;
+	}
+}
 async function runOperation(ctx, operation) {
 	const sourceId = sessionIdOf(operation.sessionId);
-	return withSourceAgent(ctx, sourceId, async (source) => {
-		const childId = sessionIdOf(`session-${crypto.randomUUID()}`);
-		const inverses = [];
-		try {
-			const events = source.session.events;
-			const plan = planOperation(operation, events);
-			const options = agentOptions(events, source.options);
-			const child = await createVersionAgent(ctx, source.session, childId, plan, options);
-			inverses.push(() => child.dispose());
-			const workspace = sourceWorkspace(ctx, sourceId);
-			if (workspace !== void 0) {
-				await workspace.attachSession(childId);
-				inverses.push(() => workspace.detachSession(childId));
-			}
-			for (const message of plan.queuedUsers) child.agent.followup(message);
-			inverses.length = 0;
-			return {
-				sessionId: childId,
-				queuedTurns: plan.queuedUsers.length
-			};
-		} catch (error) {
-			try {
-				await recoverOperation(inverses);
-			} catch (recoveryError) {
-				throw new AggregateError([error, recoveryError], "Version operation and its recovery both failed.");
-			}
-			throw error;
-		}
-	});
+	if (operation.action === "edit") {
+		const sourceSession = ctx.sessions.get(sourceId);
+		const target = (sourceSession !== void 0 ? sourceSession.events : (await ctx.sessionQuery.readSession(sourceId)).events)[operation.eventSeq];
+		const onSurface = sourceSession !== void 0 ? sourceSession.surface.nodes.includes(operation.eventSeq) : false;
+		if (target?.type === "user/message" && onSurface) return withSourceAgent(ctx, sourceId, async (source) => runInPlaceEdit(ctx, source, operation), true);
+		return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation));
+	}
+	return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation));
 }
 function ownVersionEvent(header, events) {
 	const inherited = header.seedLength ?? 0;
@@ -659,4 +717,4 @@ function apply(ctx) {
 	}), "message-edit-enhanced: HTTP route");
 }
 //#endregion
-export { MESSAGE_EDIT_PATH, MESSAGE_EDIT_VERSION_SCHEMA, MESSAGE_EDIT_VIEW_ORDER, apply, inject, name };
+export { MESSAGE_EDIT_PATH, MESSAGE_EDIT_VERSION_SCHEMA, MESSAGE_EDIT_VIEW_ORDER, apply, inject, name, runOperation };

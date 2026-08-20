@@ -606,6 +606,14 @@ export class MessageEditController {
       const result = decodeOperationResult(await responseValue(response))
       if (this.disposed) return true
       this.store.update((state) => { state.pending = null })
+      if (result.sessionId === this.sessionId) {
+        // In-place edit: the host truncated and re-sent in the CURRENT session,
+        // so there is nothing to navigate to and no branch stub to insert. The
+        // session-event subscription refreshes the timeline as the regenerated
+        // response streams in.
+        this.refreshIfLoaded()
+        return true
+      }
       try {
         this.store.update((state) => { state.switchingTo = result.sessionId })
         await this.openWhenListed(result.sessionId as SessionId)
