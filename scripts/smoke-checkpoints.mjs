@@ -1,6 +1,6 @@
 // Lifecycle smoke test for workspace checkpoints via the built bundle.
 // Run after `npm run build`: node scripts/smoke-checkpoints.mjs
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 
@@ -55,7 +55,7 @@ const ctx = {
   get(name) {
     if (name === 'fs') return fssvc
     if (name === 'workspaceRegistry') {
-      return { list: () => [{ id: 'ws1', path: ws, sessionIds: ['session-test'] }] }
+      return { list: () => [{ id: 'ws1', path: ws, sessionIds: ['session-test', 'session-prune'] }] }
     }
     return undefined
   },
@@ -188,5 +188,59 @@ for (let i = 0; i < 3; i += 1) {
 }
 await new Promise(r => setTimeout(r, 100))
 console.log('POST route OK (graceful errors, no unhandled rejections)')
+
+// 10. Stat-shortcut: a second capture with NO changes must produce identical
+// hashes (reused via stat signatures, no content reads), and changing one
+// file must change only that file's hash.
+feed[0]({ id: 'session-test' }, { type: 'user/message', seq: 30, data: { source: { kind: 'user' } } })
+await new Promise(r => setTimeout(r, 400))
+const cp30 = await m.loadCheckpoint('session-test', 30)
+if (!cp30 || cp30.v !== 2) throw new Error('v2 manifest missing after unchanged capture')
+if (JSON.stringify(Object.keys(cp30.files).sort()) !== JSON.stringify(['a.txt', 'c.md', 'sub/b.txt'])) {
+  throw new Error('unchanged capture lost files: ' + JSON.stringify(cp30.files))
+}
+for (const [path, hash] of Object.entries(cp.files)) {
+  if (cp30.files[path] !== hash) throw new Error(`hash drift on unchanged ${path}`)
+}
+writeFileSync(A, 'alpha-v3-EDITED')
+feed[0]({ id: 'session-test' }, { type: 'user/message', seq: 31, data: { source: { kind: 'user' } } })
+await new Promise(r => setTimeout(r, 400))
+const cp31 = await m.loadCheckpoint('session-test', 31)
+if (!cp31) throw new Error('seq 31 manifest missing')
+if (cp31.files['a.txt'] === cp30.files['a.txt']) throw new Error('edited file hash not updated')
+if (cp31.files['sub/b.txt'] !== cp30.files['sub/b.txt'] || cp31.files['c.md'] !== cp30.files['c.md']) {
+  throw new Error('untouched files drifted')
+}
+console.log('stat-shortcut OK (reuse + selective update)')
+
+// 11. Retention pruning: fresh home capped at 3 manifests keeps only the 3 newest.
+const home2 = mkdtempSync(join(tmpdir(), 'dsh-home2-'))
+process.env.DSH_HOME = home2
+process.env.MESSAGE_EDIT_CHECKPOINT_MANIFESTS = '3'
+for (let i = 0; i < 5; i += 1) {
+  feed[0]({ id: 'session-prune' }, { type: 'user/message', seq: 100 + i, data: { source: { kind: 'user' } } })
+  await new Promise(r => setTimeout(r, 250))
+}
+const pruneDir = join(home2, 'message-edit-enhanced', 'checkpoints', 'manifests', 'session-prune')
+const remaining = readdirSync(pruneDir).filter(n => n.endsWith('.json')).sort()
+if (remaining.length !== 3) throw new Error('retention broken, kept: ' + remaining.join(','))
+if (remaining[0] !== '102.json') throw new Error('pruned the wrong end: ' + remaining.join(','))
+console.log('retention OK:', remaining.join(','))
+
+// 12. Concurrent rollbacks on one workspace serialize and both succeed.
+process.env.DSH_HOME = home // back to the main store
+writeFileSync(A, 'alpha-v4-X')
+rmSync(B)
+const planA = await m.planRollback(ctx, 'session-test', 5)
+const [r1, r2] = await Promise.all([
+  m.applyRollback(ctx, planA, ws),
+  m.applyRollback(ctx, planA, ws),
+])
+for (const outcome of [r1, r2]) {
+  if (outcome.failures.length > 0) throw new Error('concurrent rollback failed: ' + JSON.stringify(outcome.failures))
+}
+if (readFileSync(A, 'utf8') !== 'alpha-v1') throw new Error('concurrent rollback left wrong content')
+if (!existsSync(B)) throw new Error('concurrent rollback did not restore sub/b.txt')
+console.log('workspace mutex OK (both outcomes reverted=%d/%d removed=%d/%d)', r1.reverted, r2.reverted, r1.removed, r2.removed)
 
 console.log('ALL CHECKPOINT SMOKE TESTS PASSED')

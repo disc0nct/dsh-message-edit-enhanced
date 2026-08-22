@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 //#region src/workspace-checkpoints.ts
@@ -17,9 +17,15 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 *   <root>/blobs/<hash[0:2]>/<hash>           deduplicated file contents
 *   <root>/audit.log                          JSONL audit trail of deletions
 *
-* Workspace reads/writes go through the injected `fs` service (atomic writes,
-* policy-respecting); only unlinking files created after a checkpoint falls
-* back to contained `node:fs` removal because the service has no delete API.
+* Performance: consecutive captures reuse the previous manifest's stat
+* signatures (size + mtime) to skip re-reading unchanged files entirely, so
+* steady-state captures cost one metadata stat per file instead of a full
+* content read + hash. Directory walks and hashing run under bounded
+* concurrency so large trees cannot saturate the event loop or the disk.
+*
+* Stability: rollback applies under a per-workspace mutex so two sessions
+* sharing one directory can never interleave restores; every restore payload
+* is pre-loaded before any mutation; individual failures are collected.
 */
 function fsOf(ctx) {
 	return ctx.get("fs");
@@ -29,11 +35,20 @@ function sourceWorkspaceOf(ctx, sessionId) {
 	if (registry === void 0) return void 0;
 	return registry.list().find((workspace) => workspace.sessionIds.includes(sessionId));
 }
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 const MAX_DEPTH = 12;
 const MAX_FILES = 4e3;
 const MAX_FILE_BYTES = 524288;
 const MAX_CAPTURE_BYTES = 25165824;
+/** Parallel content reads/hashes during one capture. */
+const HASH_CONCURRENCY = 12;
+/** Parallel directory listings during one walk. */
+const WALK_CONCURRENCY = 4;
+function defaultRetention() {
+	const raw = process.env["MESSAGE_EDIT_CHECKPOINT_MANIFESTS"];
+	const parsed = raw === void 0 ? NaN : Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 2 ? parsed : 500;
+}
 const IGNORED_NAMES = /* @__PURE__ */ new Set([
 	".git",
 	".hg",
@@ -98,64 +113,120 @@ function chainCapture(sessionId, task) {
 		if (captureChains.get(sessionId) === next) captureChains.delete(sessionId);
 	});
 }
-/** Walk the workspace through the injected fs service, hashing every readable
-* text file. Relative paths are built during the walk so any backend's opaque
-* display paths stay out of the stored keys. */
-async function snapshotTree(ctx, workspacePath) {
+/** Run `fn` over `items` with at most `limit` concurrent invocations. */
+async function pooled(items, limit, fn) {
+	let next = 0;
+	const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+		while (next < items.length) {
+			const index = next;
+			next += 1;
+			const item = items[index];
+			if (item === void 0) return;
+			await fn(item);
+		}
+	});
+	await Promise.all(workers);
+}
+/** Walk the workspace through the injected fs service, collecting entries with
+* bounded parallelism. Relative paths are built during the walk so any
+* backend's opaque display paths stay out of the stored keys. */
+async function collectEntries(ctx, workspacePath, result) {
 	const fs = fsOf(ctx);
 	if (fs === void 0) throw new Error("Filesystem service is not available.");
+	const rootTarget = await fs.resolve(workspacePath);
+	const entries = [];
+	const visit = async (target, relBase, depth) => {
+		if (result.fileCount >= MAX_FILES || depth > MAX_DEPTH) return;
+		const children = await fs.listDir(target);
+		const subdirs = [];
+		for (const child of children) {
+			if (result.fileCount >= MAX_FILES) return;
+			const rel = relBase === "" ? child.name : `${relBase}/${child.name}`;
+			if (child.type === "directory") {
+				if (!IGNORED_NAMES.has(child.name)) subdirs.push({
+					rel,
+					target: child.target
+				});
+				continue;
+			}
+			if (child.type !== "file") continue;
+			entries.push({
+				rel,
+				target: child.target
+			});
+		}
+		await pooled(subdirs, WALK_CONCURRENCY, (entry) => visit(entry.target, entry.rel, depth + 1));
+	};
+	await visit(rootTarget, "", 0);
+	entries.sort((a, b) => a.rel.localeCompare(b.rel));
+	return entries;
+}
+/** Hash the collected tree. Files whose size+mtime match the previous capture
+* reuse the prior hash without any content read; everything else is read and
+* hashed under bounded concurrency. */
+async function hashEntries(ctx, workspacePath, entries, previous, result) {
+	const fs = fsOf(ctx);
+	if (fs === void 0) throw new Error("Filesystem service is not available.");
+	let budget = MAX_CAPTURE_BYTES;
+	await pooled(entries, HASH_CONCURRENCY, async ({ rel, target }) => {
+		if (budget <= 0 || result.fileCount >= MAX_FILES) return;
+		const prevSig = previous?.statSigs?.[rel];
+		const prevHash = previous?.files[rel];
+		if (prevSig !== void 0 && prevHash !== void 0) try {
+			const absolute = resolve(workspacePath, ...rel.split("/"));
+			const st = await stat(absolute);
+			const sig = {
+				s: st.size,
+				m: Math.round(st.mtimeMs)
+			};
+			if (sig.s === prevSig.s && sig.m === prevSig.m) {
+				result.files[rel] = prevHash;
+				result.fileCount += 1;
+				result.statSigs[rel] = prevSig;
+				return;
+			}
+		} catch {}
+		let content;
+		try {
+			content = await fs.readText(target);
+		} catch {
+			result.skipped.push({
+				path: rel,
+				reason: "binary"
+			});
+			return;
+		}
+		if (content.length > MAX_FILE_BYTES || content.length > budget) {
+			result.skipped.push({
+				path: rel,
+				reason: "too-large"
+			});
+			return;
+		}
+		budget -= content.length;
+		const hash = hashText(content);
+		result.files[rel] = hash;
+		result.fileCount += 1;
+		try {
+			const st = await stat(resolve(workspacePath, ...rel.split("/")));
+			result.statSigs[rel] = {
+				s: st.size,
+				m: Math.round(st.mtimeMs)
+			};
+		} catch {}
+		if (!await blobExists(hash)) result.contents.set(hash, content);
+	});
+}
+async function snapshotTree(ctx, workspacePath, previous) {
 	const result = {
 		files: {},
 		fileCount: 0,
+		statSigs: {},
 		contents: /* @__PURE__ */ new Map(),
 		skipped: [],
 		warnings: []
 	};
-	const rootTarget = await fs.resolve(workspacePath);
-	let budget = MAX_CAPTURE_BYTES;
-	const visit = async (target, relBase, depth) => {
-		if (result.fileCount >= MAX_FILES || budget <= 0 || depth > MAX_DEPTH) return;
-		const children = await fs.listDir(target);
-		for (const child of children) {
-			if (result.fileCount >= MAX_FILES || budget <= 0) return;
-			const rel = relBase === "" ? child.name : `${relBase}/${child.name}`;
-			if (child.type === "directory") {
-				if (!IGNORED_NAMES.has(child.name)) await visit(child.target, rel, depth + 1);
-				continue;
-			}
-			if (child.type !== "file") continue;
-			if ((child.size ?? 0) > MAX_FILE_BYTES) {
-				result.skipped.push({
-					path: rel,
-					reason: "too-large"
-				});
-				continue;
-			}
-			let content;
-			try {
-				content = await fs.readText(child.target);
-			} catch {
-				result.skipped.push({
-					path: rel,
-					reason: "binary"
-				});
-				continue;
-			}
-			if (content.length > MAX_FILE_BYTES || content.length > budget) {
-				result.skipped.push({
-					path: rel,
-					reason: "too-large"
-				});
-				continue;
-			}
-			budget -= content.length;
-			const hash = hashText(content);
-			result.files[rel] = hash;
-			result.fileCount += 1;
-			if (!await blobExists(hash)) result.contents.set(hash, content);
-		}
-	};
-	await visit(rootTarget, "", 0);
+	await hashEntries(ctx, workspacePath, await collectEntries(ctx, workspacePath, result), previous, result);
 	if (result.fileCount >= MAX_FILES) result.warnings.push(`Workspace tree exceeds ${String(MAX_FILES)} files; snapshot covers the first ${String(MAX_FILES)}.`);
 	return result;
 }
@@ -166,7 +237,12 @@ function captureCheckpoint(ctx, sessionId, seq) {
 		try {
 			const workspace = sourceWorkspaceOf(ctx, sessionId);
 			if (workspace === void 0) return;
-			const tree = await snapshotTree(ctx, workspace.path);
+			const previous = await latestManifestBefore(sessionId, seq);
+			const previousSnapshot = previous === null ? void 0 : {
+				files: previous.files,
+				...previous.statSigs === void 0 ? {} : { statSigs: previous.statSigs }
+			};
+			const tree = await snapshotTree(ctx, workspace.path, previousSnapshot);
 			for (const [hash, content] of tree.contents) await writeAtomic(blobFile(hash), content);
 			const manifest = {
 				v: MANIFEST_VERSION,
@@ -175,18 +251,35 @@ function captureCheckpoint(ctx, sessionId, seq) {
 				time: Date.now(),
 				workspaceId: workspace.id,
 				workspacePath: workspace.path,
-				files: tree.files
+				files: tree.files,
+				statSigs: tree.statSigs
 			};
 			await writeAtomic(manifestFile(sessionId, seq), JSON.stringify(manifest));
+			await pruneManifests(sessionId, defaultRetention());
 		} catch (error) {
 			console.error("[message-edit-enhanced] checkpoint capture failed:", error);
 		}
 	});
 }
+/** Keep only the newest `retain` manifests for one session (cheap bound on
+* store growth; blobs dedupe across manifests and are left in place). */
+async function pruneManifests(sessionId, retain) {
+	const dir = join(checkpointRoot(), "manifests", safeSegment(sessionId));
+	let names;
+	try {
+		names = await readdir(dir);
+	} catch {
+		return;
+	}
+	const seqs = names.filter((name) => name.endsWith(".json")).map((name) => Number.parseInt(name.slice(0, -5), 10)).filter((value) => Number.isFinite(value)).sort((a, b) => b - a);
+	for (const stale of seqs.slice(retain)) try {
+		await rm(join(dir, `${String(stale)}.json`), { force: true });
+	} catch {}
+}
 function isManifest(value) {
 	if (typeof value !== "object" || value === null) return null;
 	const record = value;
-	if (record["v"] !== MANIFEST_VERSION) return null;
+	if (record["v"] !== 1 && record["v"] !== 2) return null;
 	if (typeof record["sessionId"] !== "string") return null;
 	if (typeof record["workspacePath"] !== "string") return null;
 	if (typeof record["seq"] !== "number" || typeof record["workspaceId"] !== "string") return null;
@@ -203,6 +296,26 @@ async function loadManifestFile(sessionId, seq) {
 /** Load the exact checkpoint captured before the given user message event. */
 async function loadCheckpoint(sessionId, seq) {
 	return loadManifestFile(sessionId, seq);
+}
+/** Latest manifest strictly below `seq`, or null. Used as the change-detection
+* baseline for the next capture. */
+async function latestManifestBefore(sessionId, seq) {
+	const dir = join(checkpointRoot(), "manifests", safeSegment(sessionId));
+	let names;
+	try {
+		names = await readdir(dir);
+	} catch {
+		return null;
+	}
+	let best = null;
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		const value = Number.parseInt(name.slice(0, -5), 10);
+		if (!Number.isFinite(value) || value >= seq) continue;
+		if (best === null || value > best) best = value;
+	}
+	if (best === null) return null;
+	return loadManifestFile(sessionId, best);
 }
 /** Build a read-only rollback plan for deleting everything from `eventSeq` on.
 * Never mutates anything. Requires the EXACT checkpoint for the target event:
@@ -249,10 +362,26 @@ function assertContained(workspacePath, rel) {
 	if (!(absolute + sep).startsWith(root + sep)) throw new Error(`Refusing to touch a path outside the workspace: ${rel}`);
 	return absolute;
 }
+/** Per-workspace rollback serialization: two sessions attached to the same
+* directory must never interleave their restores. */
+const workspaceLocks = /* @__PURE__ */ new Map();
+function withWorkspaceLock(workspacePath, task) {
+	const key = resolve(workspacePath);
+	const next = (workspaceLocks.get(key) ?? Promise.resolve()).then(task, task);
+	workspaceLocks.set(key, next);
+	next.catch(() => {}).finally(() => {
+		if (workspaceLocks.get(key) === next) workspaceLocks.delete(key);
+	});
+	return next;
+}
 /** Restore the workspace to the planned checkpoint state. Best-effort per file:
 * individual failures are collected so callers can report partial progress;
-* every restore payload is pre-loaded BEFORE anything is mutated. */
-async function applyRollback(ctx, plan, workspacePath) {
+* every restore payload is pre-loaded BEFORE anything is mutated. Serialized
+* per workspace path. */
+function applyRollback(ctx, plan, workspacePath) {
+	return withWorkspaceLock(workspacePath, () => applyRollbackLocked(ctx, plan, workspacePath));
+}
+async function applyRollbackLocked(ctx, plan, workspacePath) {
 	const outcome = {
 		reverted: 0,
 		removed: 0,

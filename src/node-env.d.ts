@@ -25,9 +25,10 @@ declare module 'node:fs/promises' {
  export interface RmOptions { force?: boolean; recursive?: boolean }
  export function mkdir(path: string, options?: MkdirOptions): Promise<string | undefined>
  export function readFile(path: string, encoding: 'utf8'): Promise<string>
+ export function readdir(path: string): Promise<string[]>
  export function rename(from: string, to: string): Promise<void>
  export function rm(path: string, options?: RmOptions): Promise<void>
- export function stat(path: string): Promise<{ size: number }>
+ export function stat(path: string): Promise<{ size: number; mtimeMs: number }>
  export function writeFile(
   path: string,
   data: string,

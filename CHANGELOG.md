@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-08-21
+
+### Changed
+- **Checkpoint captures skip unchanged files**: consecutive captures compare size+mtime signatures against the previous manifest and reuse its hashes without any content read or re-hash. Measured on a 600-file tree: cold capture ~830 ms → steady-state ~150 ms per message; a one-file change costs ~115 ms. Hashing runs under bounded concurrency (12 parallel reads, 4 parallel directory walks) so large trees no longer spike the event loop while a turn starts.
+- **Manifest retention**: only the newest 500 manifests per session are kept; `MESSAGE_EDIT_CHECKPOINT_MANIFESTS` overrides the cap (floor 2). Content blobs stay deduplicated across manifests.
+
+### Fixed
+- **Cross-session rollback races**: `applyRollback` now serializes per workspace path, so two sessions attached to the same directory can never interleave their restores.
+- **Capture baseline**: the stat-signature shortcut loads the latest manifest strictly *before* the target seq; loading the same-seq manifest (which does not exist yet) meant the shortcut could never engage.
+
 ## [0.5.0] - 2026-08-21
 
 ### Added
@@ -56,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - No `message-edit-enhanced/version` event is appended for in-place edits, keeping the timeline's `undoStack` walk cycle-free (a version event on the current session would make its own inverse match itself)
+
+[0.5.1]: https://github.com/disc0nct/dsh-message-edit-enhanced/releases/tag/v0.5.1
 
 [0.5.0]: https://github.com/disc0nct/dsh-message-edit-enhanced/releases/tag/v0.5.0
 

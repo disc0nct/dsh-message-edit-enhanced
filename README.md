@@ -60,6 +60,7 @@ The Delete control on settled user messages removes the whole exchange — the m
 - A confirmation dialog always shows the affected turns and the exact file list first. If no snapshot exists for the message, workspace changes cannot be reverted automatically and the dialog says so; you can still delete just the chat exchange.
 - Rollback runs before the conversation is truncated: if file restoration fails, the chat is left unchanged and the operation can be retried safely (it is idempotent).
 - Deletions are recorded in `checkpoints/audit.log`, and the append-only session log retains the removed exchanges as a recovery trail. Sessions without a live agent branch instead of truncating.
+- Captures are cheap in steady state: unchanged files are recognized by size+mtime and skipped without re-reading. Only the newest 500 manifests per session are retained (`MESSAGE_EDIT_CHECKPOINT_MANIFESTS` overrides).
 
 ## Stability & Performance
 
