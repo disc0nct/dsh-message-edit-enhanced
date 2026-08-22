@@ -41,6 +41,13 @@ export interface MessageEditState {
   regenerating: boolean
   /** Optimistic edited-message preview for an in-flight in-place edit. */
   optimisticEdit: { turn: number; eventSeq: number; text: string } | null
+  /** Open delete-confirmation dialog state (chat turn-tail entry point). */
+  deleteDialog: {
+    eventSeq: number
+    preview: MessageEditDeletePreview | null
+    error: string | null
+    rollback: boolean
+  } | null
 }
 
 /** Merge a burst of turn completions into one refresh. */
@@ -74,6 +81,12 @@ export interface MessageEditFace {
   previewDelete(eventSeq: number): Promise<MessageEditDeletePreview>
   /** Delete a settled user exchange; optionally roll back its workspace files. */
   deleteMessage(eventSeq: number, rollbackWorkspace: boolean): Promise<boolean>
+  /** Open the delete confirmation dialog for one settled user message. */
+  openDelete(eventSeq: number): void
+  /** Close the delete confirmation dialog without deleting. */
+  closeDelete(): void
+  /** Toggle the workspace-rollback checkbox inside the open dialog. */
+  setDeleteRollback(next: boolean): void
   openVersion(sessionId: string): Promise<void>
   exportBranch(format?: 'json' | 'markdown'): void
 }
@@ -318,6 +331,7 @@ export class MessageEditController {
     busy: false,
     regenerating: false,
     optimisticEdit: null,
+    deleteDialog: null,
   })
 
   readonly face: MessageEditFace
@@ -368,17 +382,40 @@ export class MessageEditController {
         cascade,
       }),
       reroll: () => this.mutate({ action: 'reroll', sessionId: this.sessionId }),
-      previewDelete: async eventSeq => {
-        const url = `${MESSAGE_EDIT_PATH}/delete-preview?sessionId=${encodeURIComponent(this.sessionId)}&eventSeq=${String(eventSeq)}`
-        const response = await fetch(url, { method: 'GET', headers: { accept: 'application/json' }, cache: 'no-store' })
-        return decodeDeletePreview(await responseValue(response))
-      },
+      previewDelete: eventSeq => this.fetchPreviewReport(eventSeq),
       deleteMessage: (eventSeq, rollbackWorkspace) => this.mutate({
         action: 'delete',
         sessionId: this.sessionId,
         eventSeq,
         rollbackWorkspace,
       }),
+      openDelete: (eventSeq) => {
+        this.store.update((state) => {
+          state.deleteDialog = { eventSeq, preview: null, error: null, rollback: true }
+        })
+        this.fetchPreviewReport(eventSeq)
+          .then((preview) => {
+            this.store.update((state) => {
+              if (state.deleteDialog === null || state.deleteDialog.eventSeq !== eventSeq) return
+              state.deleteDialog.preview = preview
+              state.deleteDialog.rollback = preview.checkpointFound
+            })
+          })
+          .catch((error) => {
+            this.store.update((state) => {
+              if (state.deleteDialog === null || state.deleteDialog.eventSeq !== eventSeq) return
+              state.deleteDialog.error = messageOf(error)
+            })
+          })
+      },
+      closeDelete: () => {
+        this.store.update((state) => { state.deleteDialog = null })
+      },
+      setDeleteRollback: (next) => {
+        this.store.update((state) => {
+          if (state.deleteDialog !== null) state.deleteDialog.rollback = next
+        })
+      },
       openVersion: sessionId => this.openWhenListed(sessionId as SessionId),
       exportBranch: (format) => this.downloadTimeline(format),
     }
@@ -766,7 +803,14 @@ export class MessageEditController {
     }
   }
 
-  /** Next turn number the in-place regeneration will open. */
+    /** Fetch the host's read-only delete impact report. */
+  private async fetchPreviewReport(eventSeq: number): Promise<MessageEditDeletePreview> {
+    const url = `${MESSAGE_EDIT_PATH}/delete-preview?sessionId=${encodeURIComponent(this.sessionId)}&eventSeq=${String(eventSeq)}`
+    const response = await fetch(url, { method: 'GET', headers: { accept: 'application/json' }, cache: 'no-store' })
+    return decodeDeletePreview(await responseValue(response))
+  }
+
+/** Next turn number the in-place regeneration will open. */
   private nextTurnAfterCurrent(): number {
     const timeline = this.store.getSnapshot().timeline
     if (timeline === null) return 1

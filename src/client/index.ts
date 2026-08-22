@@ -1,7 +1,11 @@
-/** Message Edit browser half: Timeline view and compact conversation-header controls. */
+/** Message Edit browser half: Timeline view, header controls, and the chat
+ * turn-tail delete affordance. */
 import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
-import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
 import { MESSAGE_EDIT_VIEW_ORDER } from '../shared.ts'
+import { ChatTurnDelete } from './ChatTurnDelete.tsx'
+import type { MessageEditFace } from './controller.ts'
 import { MessageEditController } from './controller.ts'
 import { MessageEditHeader } from './MessageEditHeader.tsx'
 import { MessageEditTimelineView } from './MessageEditTimelineView.tsx'
@@ -39,4 +43,21 @@ export function apply(ctx: ClientContext): void {
     order: MESSAGE_EDIT_VIEW_ORDER,
     inject: (sessionId: SessionId) => controllerFor(sessionId).face,
   }, MessageEditHeader)
+
+  // Chain entries carry no typed inject seat in the SlotMap contract, but the
+  // runtime records and honors one - shipped precedent:
+  // dsh-client-ui-deliverables registers ProducedFiles on this very slot with
+  // an inject face. Type the call site precisely instead of casting blind.
+  ;(ctx.slots.register as unknown as (
+    options: {
+      name: 'conversation.chat.turnTail'
+      select: (owner: TurnTailOwnerProps) => TurnTailOwnerProps
+      inject: (sessionId: SessionId) => MessageEditFace
+    },
+    component: (props: { matched: TurnTailOwnerProps } & InjectFace<MessageEditFace>) => ReturnType<typeof ChatTurnDelete>,
+  ) => () => void)({
+    name: 'conversation.chat.turnTail',
+    select: (owner) => owner,
+    inject: (sessionId) => controllerFor(sessionId).face,
+  }, ChatTurnDelete)
 }

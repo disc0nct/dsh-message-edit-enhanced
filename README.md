@@ -53,7 +53,7 @@ This path does not touch `ReactLoopAgent`, AgentLoop private methods, or apiprox
 
 ## Deleting Messages (workspace rollback)
 
-The Delete control on settled user messages removes the whole exchange — the message, its response, and every later exchange that causally depends on them.
+The Delete control appears in two places: **on every completed turn in the chat view** (before the turn's action icons), and on user-message cards in the Timeline tab's Settled Messages list. Either entry opens the same confirmation and removes the whole exchange — the message, its response, and every later exchange that causally depends on them.
 
 - Before each user message is processed, the plugin snapshots the attached workspace (path→hash manifest plus content-addressed file copies) into `<DSH_HOME>/message-edit-enhanced/checkpoints/`.
 - Deleting rolls the workspace back to the snapshot taken immediately before that message: modified files are reverted, files deleted since are restored, and files created since are removed.

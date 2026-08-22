@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-21
+
+### Added
+- **Delete in the chat view**: a Delete control now renders on every completed turn in the conversation itself — registered into the chat view's `conversation.chat.turnTail` extension chain (before each turn's action icons), so deleting no longer requires opening the Timeline tab. Clicking it opens the same confirmation dialog with the workspace-rollback impact report; the dialog is hosted by the always-mounted session header so it works over any view tab.
+- Shared `DeleteConfirmDialog` component: the Timeline view and the chat flow render one identical confirmation UI (`src/client/DeleteConfirmDialog.tsx`).
+- Controller-level dialog state (`openDelete` / `closeDelete` / `setDeleteRollback` face methods) so the chat flow survives view-tab switches without losing its open dialog.
+
 ## [0.5.1] - 2026-08-21
 
 ### Changed
@@ -66,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - No `message-edit-enhanced/version` event is appended for in-place edits, keeping the timeline's `undoStack` walk cycle-free (a version event on the current session would make its own inverse match itself)
+
+[0.6.0]: https://github.com/disc0nct/dsh-message-edit-enhanced/releases/tag/v0.6.0
 
 [0.5.1]: https://github.com/disc0nct/dsh-message-edit-enhanced/releases/tag/v0.5.1
 
