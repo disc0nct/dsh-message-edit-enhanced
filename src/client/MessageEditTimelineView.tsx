@@ -6,6 +6,7 @@ import type {
   CascadePolicy,
   EditableBlockKind,
   EditableMessageBlock,
+  MessageEditDeletePreview,
   RetryableTurn,
   VersionOperation,
   VersionSummary,
@@ -113,6 +114,7 @@ const OPERATION_LABEL: Record<Exclude<VersionOperation, undefined>, string> = {
   edit: 'Edit',
   reroll: 'Reroll',
   retry: 'Retry',
+  delete: 'Delete',
 }
 
 const FILTER_LABEL: Record<ActiveFilter, string> = {
@@ -120,6 +122,7 @@ const FILTER_LABEL: Record<ActiveFilter, string> = {
   edit: 'Edit',
   reroll: 'Reroll',
   retry: 'Retry',
+  delete: 'Delete',
   current: 'Current',
   'on-path': 'On Path',
   pinned: 'Pinned',
@@ -337,6 +340,7 @@ function MessageCard({
   onCancelEdit,
   onTextChange,
   onApplyEdit,
+  onDelete,
 }: {
   message: EditableMessageBlock
   editing: EditingState | null
@@ -346,6 +350,7 @@ function MessageCard({
   onCancelEdit: () => void
   onTextChange: (text: string) => void
   onApplyEdit: (message: EditableMessageBlock, text: string, cascade: CascadePolicy) => void
+  onDelete?: (message: EditableMessageBlock) => void
 }): ReactNode {
   const active = editing?.message.key === message.key
   return (
@@ -361,6 +366,18 @@ function MessageCard({
         >
           {active ? 'Cancel' : 'Edit'}
         </button>
+        {onDelete === null || message.kind !== 'user' ? null : (
+          <button
+            type="button"
+            className={styles['textButton']}
+            data-danger
+            disabled={disabled}
+            title="Delete this exchange and revert its workspace changes"
+            onClick={() => { onDelete?.(message) }}
+          >
+            Delete
+          </button>
+        )}
       </div>
       {active && editing !== null
         ? (
@@ -398,6 +415,8 @@ export function MessageEditTimelineView({
   edit,
   retry,
   reroll,
+  previewDelete,
+  deleteMessage,
   openVersion,
   exportBranch,
 }: MessageEditTimelineViewProps): ReactNode {
@@ -409,6 +428,38 @@ export function MessageEditTimelineView({
   const [turnSearch, setTurnSearch] = useState('')
   const [versionMeta, setVersionMeta] = useState<StoredVersionMeta>(() => loadVersionMeta())
   const [exportFormat, setExportFormat] = useState<'json' | 'markdown'>('json')
+  const [deleteTarget, setDeleteTarget] = useState<EditableMessageBlock | null>(null)
+  const [deletePreviewData, setDeletePreviewData] = useState<MessageEditDeletePreview | null>(null)
+  const [deletePreviewError, setDeletePreviewError] = useState<string | null>(null)
+  const [deleteRollback, setDeleteRollback] = useState(true)
+  const [deleteBusy, setDeleteBusy] = useState(false)
+
+  /** Open the confirmation dialog and fetch the read-only impact report. */
+  const requestDelete = (message: EditableMessageBlock): void => {
+    setDeleteTarget(message)
+    setDeletePreviewData(null)
+    setDeletePreviewError(null)
+    setDeleteRollback(true)
+    previewDelete(message.eventSeq)
+      .then((report) => {
+        setDeletePreviewData(report)
+        setDeleteRollback(report.checkpointFound)
+      })
+      .catch((error) => {
+        setDeletePreviewError(error instanceof Error ? error.message : String(error))
+      })
+  }
+
+  const confirmDelete = (): void => {
+    if (deleteTarget === null || deleteBusy) return
+    setDeleteBusy(true)
+    const rollbackWorkspace = deleteRollback && (deletePreviewData?.checkpointFound ?? false)
+    void deleteMessage(deleteTarget.eventSeq, rollbackWorkspace).finally(() => {
+      setDeleteBusy(false)
+      setDeleteTarget(null)
+      setDeletePreviewData(null)
+    })
+  }
 
   useEffect(() => {
     saveVersionMeta(versionMeta)
@@ -714,6 +765,7 @@ export function MessageEditTimelineView({
                             setEditing(current => current === null ? null : { ...current, text })
                           }}
                           onApplyEdit={applyEdit}
+                          onDelete={requestDelete}
                         />
                       ))}
                     </div>
@@ -740,6 +792,129 @@ export function MessageEditTimelineView({
             )}
         </main>
       </div>
+
+      {deleteTarget === null ? null : (
+        <div className={styles['dialogOverlay']} role="presentation" onClick={() => { if (!deleteBusy) setDeleteTarget(null) }}>
+          <div
+            className={styles['dialog']}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete message"
+            onClick={(event) => { event.stopPropagation() }}
+          >
+            <h3 className={styles['dialogTitle']}>Delete this message?</h3>
+            <p className={styles['dialogText']}>
+              This will delete the user message, its response, and revert any code changes caused by this exchange.
+            </p>
+            <pre className={styles['dialogQuote']}>{deleteTarget.text || '(empty)'}</pre>
+
+            {deletePreviewData === null && deletePreviewError === null ? (
+              <p className={styles['dialogText']}>Checking impact…</p>
+            ) : null}
+            {deletePreviewError !== null ? (
+              <p className={styles['dialogWarning']}>Impact check failed: {deletePreviewError}</p>
+            ) : null}
+
+            {deletePreviewData !== null ? (
+              <>
+                <ul className={styles['dialogFacts']}>
+                  <li>
+                    Removes turn {String(deletePreviewData.turn)}
+                    {deletePreviewData.laterTurns.length > 0
+                      ? ` and ${String(deletePreviewData.laterTurns.length)} later exchange(s) (turn ${deletePreviewData.laterTurns.map(t => String(t)).join(', ')})`
+                      : ''}
+                    .
+                  </li>
+                  <li>
+                    {deletePreviewData.willBranch
+                      ? 'This session is not live, so the deletion will create a branch without these exchanges.'
+                      : 'The exchanges are removed from this conversation in place.'}
+                    {' '}The full history stays in the session log as an audit trail.
+                  </li>
+                  {deletePreviewData.checkpointFound
+                    ? (
+                      <li>
+                        Workspace snapshot found ({deletePreviewData.workspacePath}):{' '}
+                        {String(deletePreviewData.filesToRevert.length)} file(s) to revert,{' '}
+                        {String(deletePreviewData.filesToRemove.length)} created-after file(s) to remove.
+                      </li>
+                    )
+                    : (
+                      <li>
+                        No workspace snapshot for this message
+                        {deletePreviewData.checkpointReason === undefined ? '' : `: ${deletePreviewData.checkpointReason}`}.
+                        Code changes cannot be reverted automatically.
+                      </li>
+                    )}
+                </ul>
+                {(deletePreviewData.filesToRevert.length > 0 || deletePreviewData.filesToRemove.length > 0) && deleteRollback
+                  ? (
+                    <div className={styles['fileList']}>
+                      {[...deletePreviewData.filesToRevert, ...deletePreviewData.filesToRemove].slice(0, 8).map(file => (
+                        <div key={`${file.change}:${file.path}`} className={styles['fileRow']}>
+                          <span className={styles['fileChange']} data-change={file.change}>
+                            {file.change === 'revert' ? 'revert' : 'remove'}
+                          </span>
+                          <code className={styles['filePath']}>{file.path}</code>
+                        </div>
+                      ))}
+                      {deletePreviewData.filesToRevert.length + deletePreviewData.filesToRemove.length > 8
+                        ? (
+                          <div className={styles['fileRow']}>
+                            …and {String(deletePreviewData.filesToRevert.length + deletePreviewData.filesToRemove.length - 8)} more
+                          </div>
+                        )
+                        : null}
+                    </div>
+                  )
+                  : null}
+                {deletePreviewData.skipped.length > 0
+                  ? (
+                    <p className={styles['dialogText']}>
+                      {String(deletePreviewData.skipped.length)} binary/oversized file(s) are left untouched.
+                    </p>
+                  )
+                  : null}
+                {deletePreviewData.checkpointFound
+                  ? (
+                    <label className={styles['dialogCheck']}>
+                      <input
+                        type="checkbox"
+                        checked={deleteRollback}
+                        disabled={deleteBusy}
+                        onChange={(event) => { setDeleteRollback(event.currentTarget.checked) }}
+                      />
+                      Also revert workspace changes from this exchange
+                    </label>
+                  )
+                  : null}
+                {deletePreviewData.warnings.map((warning, index) => (
+                  <p key={index} className={styles['dialogWarning']}>{warning}</p>
+                ))}
+              </>
+            ) : null}
+
+            <div className={styles['dialogActions']}>
+              <button
+                type="button"
+                className={styles['secondaryButton']}
+                disabled={deleteBusy}
+                onClick={() => { setDeleteTarget(null) }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={styles['dangerButton']}
+                disabled={deleteBusy || (deleteRollback && deletePreviewError !== null)}
+                onClick={() => { confirmDelete() }}
+              >
+                {deleteBusy ? 'Deleting…' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

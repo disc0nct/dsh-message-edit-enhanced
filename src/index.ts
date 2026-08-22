@@ -21,13 +21,24 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Workspace } from '@deepseek-ai/dsh-workspace'
 import {
+ applyRollback,
+ appendAuditEntry,
+ captureCheckpoint,
+ planRollback,
+} from './workspace-checkpoints.ts'
+
+/** Diagnostic/testing surface for the workspace checkpoint store. */
+export { applyRollback, appendAuditEntry, captureCheckpoint, loadCheckpoint, planRollback } from './workspace-checkpoints.ts'
+import {
  MESSAGE_EDIT_PATH,
  MESSAGE_EDIT_VERSION_SCHEMA,
  type CascadePolicy,
+ type DeleteOperation,
  type EditOperation,
  type EditableBlockKind,
  type EditableMessageBlock,
  type LegacyMessageEditVersionEvent,
+ type MessageEditDeletePreview,
  type MessageEditEffect,
  type MessageEditOperation,
  type MessageEditOperationResult,
@@ -45,6 +56,11 @@ export {
 } from './shared.ts'
 export type {
  CascadePolicy,
+ DeleteOperation,
+ MessageEditDeletePreview,
+ MessageEditDeleteResult,
+ DeletePreviewFile,
+ DeleteSkippedFile,
  EditOperation,
  EditableBlockKind,
  EditableMessageBlock,
@@ -120,7 +136,9 @@ function serializeSessionOperation<T>(sessionId: string, task: () => Promise<T>)
  const previous = sessionOperationQueues.get(sessionId) ?? Promise.resolve()
  const next = previous.then(() => task(), () => task())
  sessionOperationQueues.set(sessionId, next)
- void next.finally(() => {
+ // Detached cleanup must swallow the rejection on the DERIVED promise;
+ // the original `next` still reports the failure to its caller.
+ void next.catch(() => {}).finally(() => {
   if (sessionOperationQueues.get(sessionId) === next) sessionOperationQueues.delete(sessionId)
  })
  return next
@@ -444,6 +462,25 @@ function rerollPlan(sessionId: string, turns: readonly ClosedTurn[]): OperationP
  throw new Error('Current session has no settled assistant reply to regenerate.')
 }
 
+/** Branch plan that ends just before the deleted exchange (fork fallback for
+ * sessions without a live agent; the original session keeps its history). */
+function deletePlan(operation: DeleteOperation, turns: readonly ClosedTurn[]): OperationPlan {
+ const turn = turns.find(candidate => candidate.user?.seq === operation.eventSeq)
+ if (turn === undefined) throw new Error('Selected message is not a settled user message.')
+ return {
+  boundary: turn.startSeq - 1,
+  version: pairVersionEffect(operation.sessionId, {
+   operation: 'delete',
+   cascade: 'truncate',
+   targetTurn: turn.turn,
+   targetEventSeq: operation.eventSeq,
+   blockKind: 'user',
+   ...(turn.user === undefined ? {} : { before: userText(turn.user.data) }),
+  }),
+  queuedUsers: [],
+ }
+}
+
 function planOperation(operation: MessageEditOperation, events: readonly SessionEvent[]): OperationPlan {
  const turns = closedTurns(events)
  switch (operation.action) {
@@ -453,6 +490,8 @@ function planOperation(operation: MessageEditOperation, events: readonly Session
    return rerollPlan(operation.sessionId, turns)
   case 'retry':
    return retryPlan(operation.sessionId, operation.turn, operation.cascade, turns)
+  case 'delete':
+   return deletePlan(operation, turns)
  }
 }
 
@@ -720,8 +759,185 @@ async function runForkOperation(
  }
 }
 
+/** In-place delete requires the same live prerequisites as in-place edit:
+ * a live session, a live agent for the followup-free truncation, and the
+ * target user message still on the active surface. */
+function isInPlaceDeleteEligible(ctx: Context, sourceId: SessionId, operation: DeleteOperation): boolean {
+ const sourceSession = ctx.sessions.get(sourceId)
+ if (sourceSession === undefined) return false
+ if (ctx.agents.get(sourceId) === undefined) return false
+ const target = sourceSession.events[operation.eventSeq]
+ if (target?.type !== 'user/message') return false
+ return sourceSession.surface.nodes.includes(operation.eventSeq)
+}
+
+/** Delete a settled user message exchange IN PLACE: truncate the surface from
+ * the target message to the end (one empty replacement node, no regeneration),
+ * after rolling the workspace back to the checkpoint taken before the message.
+ * Rollback-first ordering keeps the conversation untouched when files fail. */
+async function runInPlaceDelete(
+ ctx: Context,
+ sourceId: SessionId,
+ operation: DeleteOperation,
+): Promise<MessageEditOperationResult> {
+ const agent = ctx.agents.get(sourceId)
+ if (agent === undefined) throw new Error('Session agent is not live; cannot delete in place.')
+ return agent.runMaintenance(async () => {
+  const session = agent.session
+  const events = session.events
+  const turns = closedTurns(events)
+  const turnIndex = turns.findIndex(turn => turn.user?.seq === operation.eventSeq)
+  const turn = turns[turnIndex]
+  if (turn === undefined || turn.user === undefined) {
+   // The event exists as a user/message but no settled turn claims it: an
+   // earlier replace already shadowed it. Deletion is idempotent here.
+   const raw = events[operation.eventSeq]
+   if (raw?.type === 'user/message') {
+    return { sessionId: session.id, queuedTurns: 0, alreadyDeleted: true }
+   }
+   throw new Error('Selected message is not a settled user message.')
+  }
+  const removedTurns = turns.slice(turnIndex).map(candidate => candidate.turn)
+
+  let revertedFiles = 0
+  let removedFiles = 0
+  let skippedFiles = 0
+  let workspaceRolledBack = false
+  if (operation.rollbackWorkspace) {
+   const plan = await planRollback(ctx, sourceId, operation.eventSeq)
+   if (!plan.available || plan.manifest === undefined) {
+    throw new Error(`Workspace rollback is not available: ${plan.reason ?? 'no checkpoint'}`)
+   }
+   const outcome = await applyRollback(ctx, plan, plan.manifest.workspacePath)
+   if (outcome.failures.length > 0) {
+    const detail = outcome.failures.slice(0, 5).map(f => `${f.path}: ${f.error}`).join('; ')
+    throw new Error(
+     `Workspace rollback failed on ${String(outcome.failures.length)} file(s); the conversation was left unchanged. `
+     + `Retry once file access is restored (${detail}${outcome.failures.length > 5 ? '; …' : ''})`,
+    )
+   }
+   revertedFiles = outcome.reverted
+   removedFiles = outcome.removed
+   skippedFiles = plan.skipped.length
+   workspaceRolledBack = true
+  }
+
+  const nodes = session.surface.nodes
+  const startIdx = nodes.indexOf(operation.eventSeq)
+  if (startIdx === -1) throw new Error('Target message is no longer on the conversation surface.')
+  const shadowed = nodes.slice(startIdx)
+  const start = shadowed[0]
+  const end = shadowed[shadowed.length - 1]
+  if (start === undefined || end === undefined) throw new Error('Target message has no surface span to delete.')
+
+  const options = agentOptions(events, agent.options)
+  const provider = options.provider
+  const model = options.model
+  if (provider === undefined || model === undefined) throw new Error('Unable to resolve model route for in-place delete.')
+  const nextTurn = (turns.at(-1)?.turn ?? 0) + 1
+  const emptyMessage = Object.freeze({
+   id: crypto.randomUUID() as unknown as AssistantMessage['id'],
+   role: 'assistant' as const,
+   content: Object.freeze([] as ContentBlock[]),
+   source: Object.freeze({ kind: 'model' as const, provider, model }),
+  }) as AssistantMessage
+  session.append('assistant/message', {
+   turn: nextTurn,
+   step: 1,
+   message: emptyMessage,
+  }, {
+   surfaceOp: { op: 'replace', start, end },
+   sourceEventSeqs: [...shadowed],
+  })
+  try {
+   await ctx.sessions.flush(session)
+  } catch (error) {
+   console.warn('In-place delete: flush failed; truncation stays in memory until the next boundary.', error)
+  }
+
+  const auditId = await appendAuditEntry({
+   kind: 'delete',
+   sessionId: session.id,
+   eventSeq: operation.eventSeq,
+   turn: turn.turn,
+   removedTurns,
+   revertedFiles,
+   removedFiles,
+   skippedFiles,
+   rollbackWorkspace: operation.rollbackWorkspace,
+  })
+
+  return {
+   sessionId: session.id,
+   queuedTurns: 0,
+   delete: {
+    removedTurns,
+    revertedFiles,
+    removedFiles,
+    skippedFiles,
+    workspaceRolledBack,
+    auditId,
+   },
+  }
+ })
+}
+
+/** Read-only impact report for the confirmation dialog. */
+async function deletePreview(ctx: Context, sourceId: SessionId, eventSeq: number): Promise<MessageEditDeletePreview> {
+ const events = await readCurrentLog(ctx, sourceId)
+ const turns = closedTurns(events)
+ const turnIndex = turns.findIndex(turn => turn.user?.seq === eventSeq)
+ const turn = turns[turnIndex]
+ if (turn === undefined || turn.user === undefined) {
+  throw new Error('Selected message is not a settled user message.')
+ }
+ const laterTurns = turns.slice(turnIndex + 1).map(candidate => candidate.turn)
+ const liveSession = ctx.sessions.get(sourceId) !== undefined
+ const liveAgent = ctx.agents.get(sourceId) !== undefined
+ const preview: MessageEditDeletePreview = {
+  sessionId: sourceId,
+  eventSeq,
+  turn: turn.turn,
+  preview: userText(turn.user.data),
+  laterTurns,
+  willBranch: !liveSession || !liveAgent,
+  checkpointFound: false,
+  filesToRevert: [],
+  filesToRemove: [],
+  skipped: [],
+  warnings: [],
+ }
+ if (preview.willBranch) {
+  preview.warnings.push('This session is not active right now, so deleting will create a branch without the deleted exchanges instead of truncating this conversation.')
+ }
+ try {
+  const plan = await planRollback(ctx, sourceId, eventSeq)
+  if (plan.available && plan.manifest !== undefined) {
+   preview.checkpointFound = true
+   preview.workspacePath = plan.manifest.workspacePath
+   preview.filesToRevert = plan.filesToWrite.map(entry => ({ path: entry.path, change: 'revert' as const }))
+   preview.filesToRemove = plan.filesToRemove.map(path => ({ path, change: 'remove' as const }))
+   preview.skipped = plan.skipped
+   preview.warnings.push(...plan.warnings)
+  } else {
+   if (plan.reason !== undefined) preview.checkpointReason = plan.reason
+   preview.warnings.push('No pre-message workspace snapshot exists, so code changes from this exchange cannot be reverted automatically.')
+  }
+ } catch (error) {
+  preview.checkpointReason = error instanceof Error ? error.message : String(error)
+  preview.warnings.push('The workspace could not be inspected for a rollback plan.')
+ }
+ return preview
+}
+
 export async function runOperation(ctx: Context, operation: MessageEditOperation): Promise<MessageEditOperationResult> {
  const sourceId = sessionIdOf(operation.sessionId)
+ if (operation.action === 'delete') {
+  if (isInPlaceDeleteEligible(ctx, sourceId, operation)) {
+   return runInPlaceDelete(ctx, sourceId, operation)
+  }
+  return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation))
+ }
  if (operation.action === 'edit' && isInPlaceEligible(ctx, sourceId, operation)) {
   return runInPlaceEdit(ctx, sourceId, operation)
  }
@@ -984,8 +1200,15 @@ function decodeOperation(value: unknown): MessageEditOperation {
     turn: integerOf(record['turn'], 'turn'),
     cascade: cascadeOf(record['cascade']),
    }
+  case 'delete':
+   return {
+    action: 'delete',
+    sessionId,
+    eventSeq: integerOf(record['eventSeq'], 'eventSeq'),
+    rollbackWorkspace: record['rollbackWorkspace'] !== false,
+   }
   default:
-   throw new TypeError("action must be 'edit', 'reroll', or 'retry'.")
+   throw new TypeError("action must be 'edit', 'reroll', 'retry', or 'delete'.")
  }
 }
 
@@ -1014,6 +1237,19 @@ function respondJson(response: HttpResponseLike, status: number, value: unknown)
   'cache-control': 'no-store',
  })
  response.end(JSON.stringify(value))
+}
+
+/** Serve GET <MESSAGE_EDIT_PATH>/delete-preview for the confirmation dialog. */
+async function handleDeletePreviewRoute(ctx: Context, request: HttpRequestLike, response: HttpResponseLike): Promise<void> {
+ try {
+  const url = new URL(request.url ?? MESSAGE_EDIT_PATH, 'http://message-edit-enhanced.local')
+  const sessionId = sessionIdOf(url.searchParams.get('sessionId'))
+  const eventSeq = integerOf(Number.parseInt(url.searchParams.get('eventSeq') ?? '', 10), 'eventSeq')
+  respondJson(response, 200, await deletePreview(ctx, sessionId, eventSeq))
+ } catch (error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  respondJson(response, error instanceof TypeError ? 400 : 409, { error: message })
+ }
 }
 
 async function handleRoute(ctx: Context, request: HttpRequestLike, response: HttpResponseLike): Promise<void> {
@@ -1045,11 +1281,23 @@ async function handleRoute(ctx: Context, request: HttpRequestLike, response: Htt
  }
 }
 
-/** Register the reversible route contribution. */
+/** Register the reversible route contributions and the checkpoint capture feed. */
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: MESSAGE_EDIT_PATH,
     handler: (request, response) => handleRoute(ctx, request, response),
   }), 'message-edit-enhanced: HTTP route')
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${MESSAGE_EDIT_PATH}/delete-preview`,
+    handler: (request, response) => handleDeletePreviewRoute(ctx, request, response),
+  }), 'message-edit-enhanced: delete-preview route')
+  // Capture a pre-message workspace checkpoint whenever any session appends a
+  // user message. Post-commit and asynchronous: never blocks or fails the feed.
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+   if (event.type !== 'user/message') return
+   if (event.data.source?.kind !== 'user') return
+   captureCheckpoint(ctx, session.id, event.seq)
+  }), 'message-edit-enhanced: workspace checkpoint capture')
 }

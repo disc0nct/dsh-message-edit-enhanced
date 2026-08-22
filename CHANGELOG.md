@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-21
+
+### Added
+- **Delete message with cascading rollback**: a Delete control on every settled user message removes the exchange (message + its response) and every later dependent exchange, truncating the conversation in place via the same surface-replace mechanism as in-place edits (`src/index.ts:runInPlaceDelete`)
+- **Per-message workspace checkpoints**: every appended user message triggers a best-effort snapshot of the attached workspace — a full path→sha256 manifest plus content-addressed text blobs under `<DSH_HOME>/message-edit-enhanced/checkpoints/`, captured post-commit via the `session/event` feed before any agent tool can run (`src/workspace-checkpoints.ts`)
+- **Workspace rollback on delete**: restoring reverts modified files to their checkpoint content, restores files deleted after the checkpoint, and removes files created after it; every restore payload is pre-loaded before any mutation so missing blobs abort cleanly with the conversation untouched
+- **`GET /message-edit-enhanced/delete-preview`**: read-only impact report (affected turns, files to revert/remove, skipped binaries, warnings) backing the confirmation dialog
+- **Delete confirmation dialog**: shows exactly what will be removed and reverted, requires explicit confirmation, blocks destructive rollback when impact cannot be determined (`src/client/MessageEditTimelineView.tsx`)
+- **Audit trail**: every deletion appends a JSONL record to `checkpoints/audit.log`; the raw session log is append-only, so removed exchanges remain recoverable there
+- **Fork fallback for deletes**: deleting in a session without a live agent branches a child ending before the deleted exchange instead of truncating, marked as a `delete` version in the timeline
+
+### Changed
+- `VersionOperation` gains `delete`; version filters and labels cover it
+- Checkpoint store skips `.git`/`node_modules`/build outputs by default and caps per-file size and total capture volume; binary/oversized files are reported as untouched rather than restored
+
+### Fixed
+- The per-session operation queue's detached cleanup promise could raise an unhandled rejection (fatal on modern Node) when an operation failed; both it and the capture chain now swallow the rejection on the derived cleanup promise while preserving the caller's error
+
 ## [0.4.0] - 2026-08-21
 
 ### Added
@@ -38,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - No `message-edit-enhanced/version` event is appended for in-place edits, keeping the timeline's `undoStack` walk cycle-free (a version event on the current session would make its own inverse match itself)
+
+[0.5.0]: https://github.com/disc0nct/dsh-message-edit-enhanced/releases/tag/v0.5.0
 
 [0.4.0]: https://github.com/disc0nct/dsh-message-edit-enhanced/releases/tag/v0.4.0
 

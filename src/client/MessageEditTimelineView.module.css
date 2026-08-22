@@ -796,3 +796,135 @@
   0%, 100% { opacity: 0.55; }
   50% { opacity: 1; }
 }
+
+/* Delete confirmation dialog */
+.dialogOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 45%);
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(80vh, 640px);
+  overflow-y: auto;
+  border-radius: 12px;
+  padding: 18px;
+  background: var(--dsw-alias-bg-module-platform);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 30%);
+}
+
+.dialogTitle {
+  margin: 0;
+  font-size: 16px;
+}
+
+.dialogText {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+}
+
+.dialogQuote {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  border-radius: 8px;
+  padding: 8px;
+  max-height: 120px;
+  overflow-y: auto;
+  font-size: 12px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.dialogFacts {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.fileList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-radius: 8px;
+  padding: 8px;
+  max-height: 140px;
+  overflow-y: auto;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.fileRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.fileChange {
+  flex: none;
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 11px;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.fileChange[data-change='remove'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.filePath {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialogCheck {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.dialogWarning {
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 12px;
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.dangerButton {
+  border-radius: 9px;
+  padding: 7px 14px;
+  cursor: pointer;
+  border: 1px solid var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-state-error-primary);
+  color: #fff;
+}
+
+.dangerButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.textButton[data-danger] {
+  color: var(--dsw-alias-state-error-primary);
+}

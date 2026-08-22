@@ -13,9 +13,12 @@ import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
 import {
   MESSAGE_EDIT_PATH,
   type CascadePolicy,
+  type DeletePreviewFile,
+  type DeleteSkippedFile,
   type EditableBlockKind,
   type EditableMessageBlock,
   type EditOperation,
+  type MessageEditDeletePreview,
   type MessageEditOperation,
   type MessageEditOperationResult,
   type MessageEditTimeline,
@@ -67,6 +70,10 @@ export interface MessageEditFace {
   edit(message: EditableMessageBlock, text: string, cascade: CascadePolicy): Promise<boolean>
   retry(turn: number, cascade: CascadePolicy): Promise<boolean>
   reroll(): Promise<boolean>
+  /** Fetch the read-only impact report backing the delete confirmation. */
+  previewDelete(eventSeq: number): Promise<MessageEditDeletePreview>
+  /** Delete a settled user exchange; optionally roll back its workspace files. */
+  deleteMessage(eventSeq: number, rollbackWorkspace: boolean): Promise<boolean>
   openVersion(sessionId: string): Promise<void>
   exportBranch(format?: 'json' | 'markdown'): void
 }
@@ -188,9 +195,74 @@ function decodeTimeline(value: unknown): MessageEditTimeline {
 
 function decodeOperationResult(value: unknown): MessageEditOperationResult {
   const data = objectValue(value, 'Operation response')
-  return {
+  const result: MessageEditOperationResult = {
     sessionId: stringValue(data['sessionId'], 'operation sessionId'),
     queuedTurns: numberValue(data['queuedTurns'], 'operation queuedTurns'),
+  }
+  if (data['alreadyDeleted'] === true) result.alreadyDeleted = true
+  if (typeof data['delete'] === 'object' && data['delete'] !== null) {
+    const detail = objectValue(data['delete'], 'delete result')
+    const turns = Array.isArray(detail['removedTurns'])
+      ? detail['removedTurns'].map((turn): number => numberValue(turn, 'removedTurns entry'))
+      : []
+    result.delete = {
+      removedTurns: turns,
+      revertedFiles: numberValue(detail['revertedFiles'], 'delete revertedFiles'),
+      removedFiles: numberValue(detail['removedFiles'], 'delete removedFiles'),
+      skippedFiles: numberValue(detail['skippedFiles'], 'delete skippedFiles'),
+      workspaceRolledBack: booleanValue(detail['workspaceRolledBack'], 'delete workspaceRolledBack'),
+      auditId: stringValue(detail['auditId'], 'delete auditId'),
+    }
+  }
+  return result
+}
+
+/** Decode one file row of the delete preview payload. */
+function decodeDeleteFile(value: unknown, index: number, change: 'revert' | 'remove'): DeletePreviewFile {
+  const row = objectValue(value, `files[${String(index)}]`)
+  return { path: stringValue(row['path'], 'file path'), change }
+}
+
+/** Decode the host's read-only delete impact report. */
+function decodeDeletePreview(value: unknown): MessageEditDeletePreview {
+  const data = objectValue(value, 'Delete preview response')
+  const laterTurns = Array.isArray(data['laterTurns'])
+    ? data['laterTurns'].map((turn): number => numberValue(turn, 'laterTurns entry'))
+    : []
+  const filesToRevert = Array.isArray(data['filesToRevert'])
+    ? data['filesToRevert'].map((row, index) => decodeDeleteFile(row, index, 'revert'))
+    : []
+  const filesToRemove = Array.isArray(data['filesToRemove'])
+    ? data['filesToRemove'].map((row, index) => decodeDeleteFile(row, index, 'remove'))
+    : []
+  const skipped: DeleteSkippedFile[] = Array.isArray(data['skipped'])
+    ? data['skipped'].map((raw, index): DeleteSkippedFile => {
+        const row = objectValue(raw, `skipped[${String(index)}]`)
+        return {
+          path: stringValue(row['path'], 'skipped path'),
+          reason: row['reason'] === 'too-large' ? 'too-large' : 'binary',
+        }
+      })
+    : []
+  const warnings = Array.isArray(data['warnings'])
+    ? data['warnings'].map((warning): string => stringValue(warning, 'warning'))
+    : []
+  const checkpointReason = typeof data['checkpointReason'] === 'string' ? data['checkpointReason'] : undefined
+  const workspacePath = typeof data['workspacePath'] === 'string' ? data['workspacePath'] : undefined
+  return {
+    sessionId: stringValue(data['sessionId'], 'preview sessionId'),
+    eventSeq: numberValue(data['eventSeq'], 'preview eventSeq'),
+    turn: numberValue(data['turn'], 'preview turn'),
+    preview: stringValue(data['preview'], 'preview text'),
+    laterTurns,
+    willBranch: booleanValue(data['willBranch'], 'preview willBranch'),
+    checkpointFound: booleanValue(data['checkpointFound'], 'preview checkpointFound'),
+    ...(checkpointReason === undefined ? {} : { checkpointReason }),
+    ...(workspacePath === undefined ? {} : { workspacePath }),
+    filesToRevert,
+    filesToRemove,
+    skipped,
+    warnings,
   }
 }
 
@@ -296,6 +368,17 @@ export class MessageEditController {
         cascade,
       }),
       reroll: () => this.mutate({ action: 'reroll', sessionId: this.sessionId }),
+      previewDelete: async eventSeq => {
+        const url = `${MESSAGE_EDIT_PATH}/delete-preview?sessionId=${encodeURIComponent(this.sessionId)}&eventSeq=${String(eventSeq)}`
+        const response = await fetch(url, { method: 'GET', headers: { accept: 'application/json' }, cache: 'no-store' })
+        return decodeDeletePreview(await responseValue(response))
+      },
+      deleteMessage: (eventSeq, rollbackWorkspace) => this.mutate({
+        action: 'delete',
+        sessionId: this.sessionId,
+        eventSeq,
+        rollbackWorkspace,
+      }),
       openVersion: sessionId => this.openWhenListed(sessionId as SessionId),
       exportBranch: (format) => this.downloadTimeline(format),
     }
@@ -326,7 +409,9 @@ export class MessageEditController {
       current: true,
       onCurrentEffectPath: true,
       operation: operation.action,
-      cascade: operation.action !== 'reroll' ? (operation as EditOperation | RetryOperation).cascade : undefined,
+      cascade: operation.action === 'edit' || operation.action === 'retry'
+        ? (operation as EditOperation | RetryOperation).cascade
+        : undefined,
       ...operation.action === 'edit'
         ? {
             targetTurn: eventTurn,
@@ -638,28 +723,36 @@ export class MessageEditController {
       const result = decodeOperationResult(await responseValue(response))
       if (this.disposed) return true
       this.store.update((state) => { state.pending = null })
-      if (result.sessionId === this.sessionId) {
+      if (result.sessionId !== this.sessionId) {
+        // Fork fallback (non-live session): the deletion branched instead of
+        // truncating, so navigate to the child like any other version op.
+        try {
+          this.store.update((state) => { state.switchingTo = result.sessionId })
+          await this.openWhenListed(result.sessionId as SessionId)
+        } finally {
+          this.store.update((state) => { state.switchingTo = null })
+        }
+        this.appendStubVersion(result.sessionId, operation)
+        return true
+      }
+      if (operation.action === 'delete') {
+        // In-place truncation does not bump turnEnds, so refresh explicitly.
+        // alreadyDeleted results converge to the same visible state.
+        this.refreshIfLoaded()
+        return true
+      }
+      if (operation.action === 'edit') {
         // In-place edit: the host truncated and re-sent in the CURRENT session.
         // No navigation and no branch stub. Show an optimistic edited-message
         // preview immediately; the session-event subscription refreshes the
         // timeline when the regenerated turn lands (one refresh, no double GET).
-        if (operation.action === 'edit') {
-          const edit = operation as EditOperation
-          const nextTurn = this.nextTurnAfterCurrent()
-          this.store.update((state) => {
-            state.optimisticEdit = { turn: nextTurn, eventSeq: edit.eventSeq, text: edit.text }
-            state.regenerating = true
-          })
-        }
-        return true
+        const edit = operation as EditOperation
+        const nextTurn = this.nextTurnAfterCurrent()
+        this.store.update((state) => {
+          state.optimisticEdit = { turn: nextTurn, eventSeq: edit.eventSeq, text: edit.text }
+          state.regenerating = true
+        })
       }
-      try {
-        this.store.update((state) => { state.switchingTo = result.sessionId })
-        await this.openWhenListed(result.sessionId as SessionId)
-      } finally {
-        this.store.update((state) => { state.switchingTo = null })
-      }
-      this.appendStubVersion(result.sessionId, operation)
       return true
     } catch (error) {
       if (this.disposed) return false

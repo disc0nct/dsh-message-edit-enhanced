@@ -106,9 +106,61 @@ window.__ModuleLoader__.load({
 		}
 		function decodeOperationResult(value) {
 			const data = objectValue(value, "Operation response");
-			return {
+			const result = {
 				sessionId: stringValue(data["sessionId"], "operation sessionId"),
 				queuedTurns: numberValue(data["queuedTurns"], "operation queuedTurns")
+			};
+			if (data["alreadyDeleted"] === true) result.alreadyDeleted = true;
+			if (typeof data["delete"] === "object" && data["delete"] !== null) {
+				const detail = objectValue(data["delete"], "delete result");
+				result.delete = {
+					removedTurns: Array.isArray(detail["removedTurns"]) ? detail["removedTurns"].map((turn) => numberValue(turn, "removedTurns entry")) : [],
+					revertedFiles: numberValue(detail["revertedFiles"], "delete revertedFiles"),
+					removedFiles: numberValue(detail["removedFiles"], "delete removedFiles"),
+					skippedFiles: numberValue(detail["skippedFiles"], "delete skippedFiles"),
+					workspaceRolledBack: booleanValue(detail["workspaceRolledBack"], "delete workspaceRolledBack"),
+					auditId: stringValue(detail["auditId"], "delete auditId")
+				};
+			}
+			return result;
+		}
+		/** Decode one file row of the delete preview payload. */
+		function decodeDeleteFile(value, index, change) {
+			return {
+				path: stringValue(objectValue(value, `files[${String(index)}]`)["path"], "file path"),
+				change
+			};
+		}
+		/** Decode the host's read-only delete impact report. */
+		function decodeDeletePreview(value) {
+			const data = objectValue(value, "Delete preview response");
+			const laterTurns = Array.isArray(data["laterTurns"]) ? data["laterTurns"].map((turn) => numberValue(turn, "laterTurns entry")) : [];
+			const filesToRevert = Array.isArray(data["filesToRevert"]) ? data["filesToRevert"].map((row, index) => decodeDeleteFile(row, index, "revert")) : [];
+			const filesToRemove = Array.isArray(data["filesToRemove"]) ? data["filesToRemove"].map((row, index) => decodeDeleteFile(row, index, "remove")) : [];
+			const skipped = Array.isArray(data["skipped"]) ? data["skipped"].map((raw, index) => {
+				const row = objectValue(raw, `skipped[${String(index)}]`);
+				return {
+					path: stringValue(row["path"], "skipped path"),
+					reason: row["reason"] === "too-large" ? "too-large" : "binary"
+				};
+			}) : [];
+			const warnings = Array.isArray(data["warnings"]) ? data["warnings"].map((warning) => stringValue(warning, "warning")) : [];
+			const checkpointReason = typeof data["checkpointReason"] === "string" ? data["checkpointReason"] : void 0;
+			const workspacePath = typeof data["workspacePath"] === "string" ? data["workspacePath"] : void 0;
+			return {
+				sessionId: stringValue(data["sessionId"], "preview sessionId"),
+				eventSeq: numberValue(data["eventSeq"], "preview eventSeq"),
+				turn: numberValue(data["turn"], "preview turn"),
+				preview: stringValue(data["preview"], "preview text"),
+				laterTurns,
+				willBranch: booleanValue(data["willBranch"], "preview willBranch"),
+				checkpointFound: booleanValue(data["checkpointFound"], "preview checkpointFound"),
+				...checkpointReason === void 0 ? {} : { checkpointReason },
+				...workspacePath === void 0 ? {} : { workspacePath },
+				filesToRevert,
+				filesToRemove,
+				skipped,
+				warnings
 			};
 		}
 		async function responseValue(response) {
@@ -214,6 +266,20 @@ window.__ModuleLoader__.load({
 						action: "reroll",
 						sessionId: this.sessionId
 					}),
+					previewDelete: async (eventSeq) => {
+						const url = `${MESSAGE_EDIT_PATH}/delete-preview?sessionId=${encodeURIComponent(this.sessionId)}&eventSeq=${String(eventSeq)}`;
+						return decodeDeletePreview(await responseValue(await fetch(url, {
+							method: "GET",
+							headers: { accept: "application/json" },
+							cache: "no-store"
+						})));
+					},
+					deleteMessage: (eventSeq, rollbackWorkspace) => this.mutate({
+						action: "delete",
+						sessionId: this.sessionId,
+						eventSeq,
+						rollbackWorkspace
+					}),
 					openVersion: (sessionId) => this.openWhenListed(sessionId),
 					exportBranch: (format) => this.downloadTimeline(format)
 				};
@@ -244,7 +310,7 @@ window.__ModuleLoader__.load({
 					current: true,
 					onCurrentEffectPath: true,
 					operation: operation.action,
-					cascade: operation.action !== "reroll" ? operation.cascade : void 0,
+					cascade: operation.action === "edit" || operation.action === "retry" ? operation.cascade : void 0,
 					...operation.action === "edit" ? {
 						targetTurn: eventTurn,
 						targetEventSeq: operation.eventSeq,
@@ -525,32 +591,36 @@ window.__ModuleLoader__.load({
 					this.store.update((state) => {
 						state.pending = null;
 					});
-					if (result.sessionId === this.sessionId) {
-						if (operation.action === "edit") {
-							const edit = operation;
-							const nextTurn = this.nextTurnAfterCurrent();
+					if (result.sessionId !== this.sessionId) {
+						try {
 							this.store.update((state) => {
-								state.optimisticEdit = {
-									turn: nextTurn,
-									eventSeq: edit.eventSeq,
-									text: edit.text
-								};
-								state.regenerating = true;
+								state.switchingTo = result.sessionId;
+							});
+							await this.openWhenListed(result.sessionId);
+						} finally {
+							this.store.update((state) => {
+								state.switchingTo = null;
 							});
 						}
+						this.appendStubVersion(result.sessionId, operation);
 						return true;
 					}
-					try {
+					if (operation.action === "delete") {
+						this.refreshIfLoaded();
+						return true;
+					}
+					if (operation.action === "edit") {
+						const edit = operation;
+						const nextTurn = this.nextTurnAfterCurrent();
 						this.store.update((state) => {
-							state.switchingTo = result.sessionId;
-						});
-						await this.openWhenListed(result.sessionId);
-					} finally {
-						this.store.update((state) => {
-							state.switchingTo = null;
+							state.optimisticEdit = {
+								turn: nextTurn,
+								eventSeq: edit.eventSeq,
+								text: edit.text
+							};
+							state.regenerating = true;
 						});
 					}
-					this.appendStubVersion(result.sessionId, operation);
 					return true;
 				} catch (error) {
 					if (this.disposed) return false;
@@ -610,14 +680,14 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var InlineMessageEdit_module_css_default = {
-			"panel": "D60d8a_panel",
-			"picker": "D60d8a_picker",
-			"pickerItemActive": "D60d8a_pickerItemActive",
 			"title": "D60d8a_title",
 			"input": "D60d8a_input",
+			"panel": "D60d8a_panel",
 			"iconButton": "D60d8a_iconButton",
-			"pickerItem": "D60d8a_pickerItem",
+			"picker": "D60d8a_picker",
 			"overlay": "D60d8a_overlay",
+			"pickerItem": "D60d8a_pickerItem",
+			"pickerItemActive": "D60d8a_pickerItemActive",
 			"footer": "D60d8a_footer"
 		};
 		//#endregion
@@ -911,10 +981,10 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditHeader_module_css_default = {
-			"root": "EM6NxG_root",
 			"counter": "EM6NxG_counter",
 			"iconButton": "EM6NxG_iconButton",
-			"rerollButton": "EM6NxG_rerollButton"
+			"rerollButton": "EM6NxG_rerollButton",
+			"root": "EM6NxG_root"
 		};
 		//#endregion
 		//#region src/client/MessageEditHeader.tsx
@@ -979,7 +1049,7 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region \0dsh-css:/home/silini/tools/deepseek plugins/dsh-message-edit-enhanced/src/client/MessageEditTimelineView.module.css.mjs
-		const css = ".kxmlFa_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.kxmlFa_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.kxmlFa_title,.kxmlFa_intro,.kxmlFa_subtitle,.kxmlFa_notice,.kxmlFa_error,.kxmlFa_empty,.kxmlFa_turnTitle,.kxmlFa_turnPreview,.kxmlFa_messageText{margin:0}.kxmlFa_title{font-size:22px;font-weight:600;line-height:30px}.kxmlFa_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.kxmlFa_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.kxmlFa_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterSearch,.kxmlFa_filterChip{box-sizing:border-box;font:inherit}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_filterSearch{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.kxmlFa_select{height:34px;padding:0 30px 0 9px;font-size:12px}.kxmlFa_filterSearch{width:100%;height:32px;padding:0 10px;font-size:12px}.kxmlFa_filterSearch:focus{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterChip{cursor:pointer;border:0}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_filterChip{border-radius:14px;justify-content:center;align-items:center;min-height:28px;padding:0 10px;font-size:11px;line-height:18px;display:inline-flex}.kxmlFa_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.kxmlFa_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.kxmlFa_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.kxmlFa_secondaryButton:hover:not(:disabled),.kxmlFa_textButton:hover:not(:disabled),.kxmlFa_versionButton:hover:not(:disabled),.kxmlFa_filterChip:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.kxmlFa_primaryButton:disabled,.kxmlFa_secondaryButton:disabled,.kxmlFa_textButton:disabled,.kxmlFa_versionButton:disabled,.kxmlFa_filterChip:disabled,.kxmlFa_select:disabled,.kxmlFa_filterSearch:disabled{cursor:default;opacity:.45}.kxmlFa_primaryButton:focus-visible,.kxmlFa_secondaryButton:focus-visible,.kxmlFa_textButton:focus-visible,.kxmlFa_versionButton:focus-visible,.kxmlFa_filterChip:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_notice,.kxmlFa_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.kxmlFa_notice{color:var(--dsw-alias-state-warn-label)}.kxmlFa_error{color:var(--dsw-alias-state-error-primary)}.kxmlFa_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.kxmlFa_status .kxmlFa_error{margin:0}.kxmlFa_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.kxmlFa_versionsPanel,.kxmlFa_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.kxmlFa_versionsPanel{position:sticky;top:0}.kxmlFa_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.kxmlFa_filterBar{flex-direction:column;gap:8px;margin-bottom:12px;display:flex}.kxmlFa_filterChips{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_filterChip{color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);background:0 0;border-radius:12px;min-height:26px;padding:2px 8px;font-size:11px;line-height:18px}.kxmlFa_filterChip[data-active]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform)}.kxmlFa_turnFilterBar{margin-bottom:12px}.kxmlFa_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.kxmlFa_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.kxmlFa_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_effectButtons .kxmlFa_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.kxmlFa_subtitle{font-size:16px;font-weight:500;line-height:24px}.kxmlFa_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.kxmlFa_versionList,.kxmlFa_turnList{margin:0;padding:0;list-style:none}.kxmlFa_versionListScroller{min-height:120px;max-height:520px;overflow:auto}.kxmlFa_versionList{width:100%;position:relative}.kxmlFa_versionItem{--message-edit-enhanced-depth:0;padding-left:calc(var(--message-edit-enhanced-depth) * 14px);position:relative}.kxmlFa_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.kxmlFa_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.kxmlFa_versionButton:not([data-current]) .kxmlFa_pathBadge{opacity:.8}.kxmlFa_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.kxmlFa_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.kxmlFa_versionButton[data-current] .kxmlFa_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.kxmlFa_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.kxmlFa_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.kxmlFa_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.kxmlFa_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.kxmlFa_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.kxmlFa_currentBadge,.kxmlFa_pathBadge,.kxmlFa_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.kxmlFa_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_turnList{flex-direction:column;gap:14px;display:flex}.kxmlFa_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.kxmlFa_turnHeader,.kxmlFa_messageHeader,.kxmlFa_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.kxmlFa_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.kxmlFa_turnTitle{font-size:14px;font-weight:500;line-height:22px}.kxmlFa_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.kxmlFa_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.kxmlFa_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.kxmlFa_messageHeader{justify-content:flex-start}.kxmlFa_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.kxmlFa_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.kxmlFa_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.kxmlFa_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.kxmlFa_editor{margin-top:8px}.kxmlFa_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.kxmlFa_editorActions{margin-top:8px}.kxmlFa_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.kxmlFa_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}.kxmlFa_versionExpand{background:var(--dsw-alias-bg-module-hover);width:24px;height:24px;color:var(--dsw-alias-label-secondary);cursor:pointer;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;font-size:10px;line-height:1;display:flex}.kxmlFa_versionExpand:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kxmlFa_versionExpand:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionDiffPanel{background:var(--dsw-alias-bg-module-platform);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;margin-top:8px;padding:10px;animation:.15s ease-out kxmlFa_slideDown}@keyframes kxmlFa_slideDown{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.kxmlFa_versionDiffHeader{border-bottom:1px solid var(--dsw-alias-border-l2);margin-bottom:8px;padding-bottom:8px}.kxmlFa_diffLegend{color:var(--dsw-alias-label-tertiary);gap:12px;font-size:10px;display:flex}.kxmlFa_diffLegend span{border-radius:4px;padding:1px 6px}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary)}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary)}.kxmlFa_diffEqual{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary)}.kxmlFa_versionDiffContent{background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;word-wrap:break-word;border-radius:6px;max-height:300px;margin:0;padding:8px;font-family:inherit;font-size:12px;line-height:1.6;overflow:auto}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary);border-radius:2px;padding:0 2px;text-decoration:line-through}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary);border-radius:2px;padding:0 2px}.kxmlFa_diffEqual{color:var(--dsw-alias-label-secondary)}.kxmlFa_versionPin{width:26px;height:26px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:0 0;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;padding:0;font-size:14px;line-height:1;display:inline-flex}.kxmlFa_versionPin:hover{background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-brand-primary)}.kxmlFa_versionPin:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionTags{flex-wrap:wrap;gap:4px;margin-top:4px;display:inline-flex}.kxmlFa_versionTag{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-brand-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:1px 6px;font-size:10px;line-height:16px}.kxmlFa_versionNote{color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:11px;font-style:italic;line-height:16px;display:block}@media (width<=1000px){.kxmlFa_columns{grid-template-columns:1fr}.kxmlFa_versionsPanel{position:static}}@media (width<=680px){.kxmlFa_root{padding:16px}.kxmlFa_pageHeader,.kxmlFa_headerActions,.kxmlFa_turnHeader,.kxmlFa_editorActions{flex-direction:column;align-items:stretch}.kxmlFa_headerActions,.kxmlFa_primaryButton,.kxmlFa_secondaryButton{width:100%}}.kxmlFa_optimisticMessage{background:var(--dsw-alias-bg-module-platform);border:1px dashed var(--dsw-alias-border-strong);border-radius:9px;flex-direction:column;gap:6px;padding:10px;display:flex}.kxmlFa_optimisticKind{color:var(--dsw-alias-label-secondary);font-size:12px}.kxmlFa_optimisticText{white-space:pre-wrap;overflow-wrap:anywhere}.kxmlFa_optimisticPulse{color:var(--dsw-alias-label-tertiary);align-self:flex-start;font-size:12px;animation:1.2s ease-in-out infinite kxmlFa_messageEditOptimisticPulse}@keyframes kxmlFa_messageEditOptimisticPulse{0%,to{opacity:.55}50%{opacity:1}}";
+		const css = ".kxmlFa_root{box-sizing:border-box;width:100%;height:100%;min-height:0;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);padding:24px;overflow:auto}.kxmlFa_pageHeader{justify-content:space-between;align-items:flex-start;gap:20px;max-width:1480px;margin:0 auto 16px;display:flex}.kxmlFa_title,.kxmlFa_intro,.kxmlFa_subtitle,.kxmlFa_notice,.kxmlFa_error,.kxmlFa_empty,.kxmlFa_turnTitle,.kxmlFa_turnPreview,.kxmlFa_messageText{margin:0}.kxmlFa_title{font-size:22px;font-weight:600;line-height:30px}.kxmlFa_intro{max-width:700px;color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:13px;line-height:20px}.kxmlFa_headerActions{flex:none;align-items:flex-end;gap:8px;display:flex}.kxmlFa_cascadeField{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;font-size:11px;line-height:16px;display:flex}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterSearch,.kxmlFa_filterChip{box-sizing:border-box;font:inherit}.kxmlFa_select,.kxmlFa_textarea,.kxmlFa_filterSearch{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border-radius:8px}.kxmlFa_select{height:34px;padding:0 30px 0 9px;font-size:12px}.kxmlFa_filterSearch{width:100%;height:32px;padding:0 10px;font-size:12px}.kxmlFa_filterSearch:focus{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_textButton,.kxmlFa_versionButton,.kxmlFa_filterChip{cursor:pointer;border:0}.kxmlFa_primaryButton,.kxmlFa_secondaryButton,.kxmlFa_filterChip{border-radius:14px;justify-content:center;align-items:center;min-height:28px;padding:0 10px;font-size:11px;line-height:18px;display:inline-flex}.kxmlFa_primaryButton{color:var(--dsw-alias-label-primary-foreground);background:var(--dsw-alias-button-primary-fill)}.kxmlFa_primaryButton:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}.kxmlFa_secondaryButton{border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:0 0}.kxmlFa_secondaryButton:hover:not(:disabled),.kxmlFa_textButton:hover:not(:disabled),.kxmlFa_versionButton:hover:not(:disabled),.kxmlFa_filterChip:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}.kxmlFa_primaryButton:disabled,.kxmlFa_secondaryButton:disabled,.kxmlFa_textButton:disabled,.kxmlFa_versionButton:disabled,.kxmlFa_filterChip:disabled,.kxmlFa_select:disabled,.kxmlFa_filterSearch:disabled{cursor:default;opacity:.45}.kxmlFa_primaryButton:focus-visible,.kxmlFa_secondaryButton:focus-visible,.kxmlFa_textButton:focus-visible,.kxmlFa_versionButton:focus-visible,.kxmlFa_filterChip:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_notice,.kxmlFa_error{max-width:1480px;margin:0 auto 10px;font-size:12px;line-height:18px}.kxmlFa_notice{color:var(--dsw-alias-state-warn-label)}.kxmlFa_error{color:var(--dsw-alias-state-error-primary)}.kxmlFa_status{box-sizing:border-box;width:100%;height:100%;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);flex-direction:column;align-items:flex-start;gap:12px;padding:24px;display:flex}.kxmlFa_status .kxmlFa_error{margin:0}.kxmlFa_columns{grid-template-columns:minmax(280px,.72fr) minmax(520px,1.75fr);align-items:start;gap:18px;max-width:1480px;margin:0 auto;display:grid}.kxmlFa_versionsPanel,.kxmlFa_turnsPanel{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;min-width:0;padding:16px}.kxmlFa_versionsPanel{position:sticky;top:0}.kxmlFa_sectionHeading{justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;display:flex}.kxmlFa_filterBar{flex-direction:column;gap:8px;margin-bottom:12px;display:flex}.kxmlFa_filterChips{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_filterChip{color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);background:0 0;border-radius:12px;min-height:26px;padding:2px 8px;font-size:11px;line-height:18px}.kxmlFa_filterChip[data-active]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-module-platform)}.kxmlFa_turnFilterBar{margin-bottom:12px}.kxmlFa_effectControls{background:var(--dsw-alias-bg-module-platform);border-radius:9px;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px;display:flex}.kxmlFa_effectDepth{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}.kxmlFa_effectButtons{flex-wrap:wrap;gap:6px;display:flex}.kxmlFa_effectButtons .kxmlFa_secondaryButton{min-height:28px;padding:0 10px;font-size:11px}.kxmlFa_subtitle{font-size:16px;font-weight:500;line-height:24px}.kxmlFa_count{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}.kxmlFa_versionList,.kxmlFa_turnList{margin:0;padding:0;list-style:none}.kxmlFa_versionListScroller{min-height:120px;max-height:520px;overflow:auto}.kxmlFa_versionList{width:100%;position:relative}.kxmlFa_versionItem{--message-edit-enhanced-depth:0;padding-left:calc(var(--message-edit-enhanced-depth) * 14px);position:relative}.kxmlFa_versionButton{width:100%;min-width:0;color:var(--dsw-alias-label-secondary);text-align:left;background:0 0;border-radius:9px;align-items:flex-start;gap:9px;padding:9px;display:flex;position:relative}.kxmlFa_versionButton[data-current]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-module-platform);opacity:1}.kxmlFa_versionButton:not([data-current]) .kxmlFa_pathBadge{opacity:.8}.kxmlFa_versionLine{background:var(--dsw-alias-border-l2);width:1px;position:absolute;top:0;bottom:0;left:14px}.kxmlFa_versionDot{z-index:1;border:2px solid var(--dsw-alias-bg-layer-1);background:var(--dsw-alias-label-tertiary);border-radius:50%;flex:none;width:7px;height:7px;margin-top:6px}.kxmlFa_versionButton[data-current] .kxmlFa_versionDot{border-color:var(--dsw-alias-bg-module-platform);background:var(--dsw-alias-brand-primary)}.kxmlFa_versionMain{flex-direction:column;flex:1;min-width:0;display:flex}.kxmlFa_versionTitle{text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:20px;overflow:hidden}.kxmlFa_versionMeta{color:var(--dsw-alias-label-tertiary);text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:16px;overflow:hidden}.kxmlFa_versionDiff{color:var(--dsw-alias-label-tertiary);flex-direction:column;gap:2px;margin-top:5px;font-size:10px;line-height:15px;display:flex}.kxmlFa_versionDiff span{-webkit-line-clamp:2;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-orient:vertical;display:-webkit-box;overflow:hidden}.kxmlFa_currentBadge,.kxmlFa_pathBadge,.kxmlFa_kindBadge{border-radius:9px;flex:none;padding:1px 6px;font-size:10px;line-height:17px}.kxmlFa_currentBadge{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_pathBadge{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_turnList{flex-direction:column;gap:14px;display:flex}.kxmlFa_turnSection{border:1px solid var(--dsw-alias-border-l2);border-radius:11px;padding:13px}.kxmlFa_turnHeader,.kxmlFa_messageHeader,.kxmlFa_editorActions{justify-content:space-between;align-items:center;gap:10px;display:flex}.kxmlFa_turnHeader{border-bottom:1px solid var(--dsw-alias-border-l2);align-items:flex-start;padding-bottom:11px}.kxmlFa_turnTitle{font-size:14px;font-weight:500;line-height:22px}.kxmlFa_turnPreview{max-width:700px;color:var(--dsw-alias-label-tertiary);-webkit-line-clamp:2;white-space:pre-wrap;-webkit-box-orient:vertical;font-size:11px;line-height:17px;display:-webkit-box;overflow:hidden}.kxmlFa_messageList{flex-direction:column;gap:8px;margin-top:10px;display:flex}.kxmlFa_messageCard{background:var(--dsw-alias-bg-module-platform);border-radius:9px;padding:10px}.kxmlFa_messageHeader{justify-content:flex-start}.kxmlFa_kindBadge{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}.kxmlFa_kindBadge[data-kind=assistant\\.reasoning]{color:var(--dsw-alias-label-tertiary)}.kxmlFa_messageTime{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:17px}.kxmlFa_textButton{color:var(--dsw-alias-label-secondary);background:0 0;border-radius:12px;margin-left:auto;padding:3px 8px;font-size:11px;line-height:17px}.kxmlFa_messageText{max-height:220px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-family:inherit;font-size:12px;line-height:19px;overflow:auto}.kxmlFa_editor{margin-top:8px}.kxmlFa_textarea{resize:vertical;width:100%;min-height:120px;padding:9px;font-size:12px;line-height:19px}.kxmlFa_editorActions{margin-top:8px}.kxmlFa_editorHint{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}.kxmlFa_empty{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-module-platform);border-radius:10px;padding:18px;font-size:13px;line-height:20px}.kxmlFa_versionExpand{background:var(--dsw-alias-bg-module-hover);width:24px;height:24px;color:var(--dsw-alias-label-secondary);cursor:pointer;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;font-size:10px;line-height:1;display:flex}.kxmlFa_versionExpand:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kxmlFa_versionExpand:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionDiffPanel{background:var(--dsw-alias-bg-module-platform);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;margin-top:8px;padding:10px;animation:.15s ease-out kxmlFa_slideDown}@keyframes kxmlFa_slideDown{0%{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}.kxmlFa_versionDiffHeader{border-bottom:1px solid var(--dsw-alias-border-l2);margin-bottom:8px;padding-bottom:8px}.kxmlFa_diffLegend{color:var(--dsw-alias-label-tertiary);gap:12px;font-size:10px;display:flex}.kxmlFa_diffLegend span{border-radius:4px;padding:1px 6px}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary)}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary)}.kxmlFa_diffEqual{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary)}.kxmlFa_versionDiffContent{background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;word-wrap:break-word;border-radius:6px;max-height:300px;margin:0;padding:8px;font-family:inherit;font-size:12px;line-height:1.6;overflow:auto}.kxmlFa_diffDelete{background:var(--dsw-alias-state-error-bg);color:var(--dsw-alias-state-error-primary);border-radius:2px;padding:0 2px;text-decoration:line-through}.kxmlFa_diffInsert{background:var(--dsw-alias-state-success-bg);color:var(--dsw-alias-state-success-primary);border-radius:2px;padding:0 2px}.kxmlFa_diffEqual{color:var(--dsw-alias-label-secondary)}.kxmlFa_versionPin{width:26px;height:26px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:0 0;border:none;border-radius:4px;flex:none;justify-content:center;align-items:center;margin-left:8px;padding:0;font-size:14px;line-height:1;display:inline-flex}.kxmlFa_versionPin:hover{background:var(--dsw-alias-bg-module-hover);color:var(--dsw-alias-brand-primary)}.kxmlFa_versionPin:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}.kxmlFa_versionTags{flex-wrap:wrap;gap:4px;margin-top:4px;display:inline-flex}.kxmlFa_versionTag{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-brand-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:1px 6px;font-size:10px;line-height:16px}.kxmlFa_versionNote{color:var(--dsw-alias-label-tertiary);margin-top:4px;font-size:11px;font-style:italic;line-height:16px;display:block}@media (width<=1000px){.kxmlFa_columns{grid-template-columns:1fr}.kxmlFa_versionsPanel{position:static}}@media (width<=680px){.kxmlFa_root{padding:16px}.kxmlFa_pageHeader,.kxmlFa_headerActions,.kxmlFa_turnHeader,.kxmlFa_editorActions{flex-direction:column;align-items:stretch}.kxmlFa_headerActions,.kxmlFa_primaryButton,.kxmlFa_secondaryButton{width:100%}}.kxmlFa_optimisticMessage{background:var(--dsw-alias-bg-module-platform);border:1px dashed var(--dsw-alias-border-strong);border-radius:9px;flex-direction:column;gap:6px;padding:10px;display:flex}.kxmlFa_optimisticKind{color:var(--dsw-alias-label-secondary);font-size:12px}.kxmlFa_optimisticText{white-space:pre-wrap;overflow-wrap:anywhere}.kxmlFa_optimisticPulse{color:var(--dsw-alias-label-tertiary);align-self:flex-start;font-size:12px;animation:1.2s ease-in-out infinite kxmlFa_messageEditOptimisticPulse}@keyframes kxmlFa_messageEditOptimisticPulse{0%,to{opacity:.55}50%{opacity:1}}.kxmlFa_dialogOverlay{z-index:60;background:#00000073;justify-content:center;align-items:center;display:flex;position:fixed;inset:0}.kxmlFa_dialog{background:var(--dsw-alias-bg-module-platform);border-radius:12px;flex-direction:column;gap:10px;width:min(560px,100vw - 48px);max-height:min(80vh,640px);padding:18px;display:flex;overflow-y:auto;box-shadow:0 12px 40px #0000004d}.kxmlFa_dialogTitle{margin:0;font-size:16px}.kxmlFa_dialogText{color:var(--dsw-alias-label-secondary);margin:0;font-size:13px}.kxmlFa_dialogQuote{overflow-wrap:anywhere;white-space:pre-wrap;background:var(--dsw-alias-bg-layer-1);border-radius:8px;max-height:120px;margin:0;padding:8px;font-size:12px;overflow-y:auto}.kxmlFa_dialogFacts{color:var(--dsw-alias-label-secondary);flex-direction:column;gap:4px;margin:0;padding-left:18px;font-size:13px;display:flex}.kxmlFa_fileList{background:var(--dsw-alias-bg-layer-1);border-radius:8px;flex-direction:column;gap:2px;max-height:140px;padding:8px;display:flex;overflow-y:auto}.kxmlFa_fileRow{align-items:center;gap:8px;font-size:12px;display:flex}.kxmlFa_fileChange{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);border-radius:5px;flex:none;padding:1px 6px;font-size:11px}.kxmlFa_fileChange[data-change=remove]{color:var(--dsw-alias-state-error-primary)}.kxmlFa_filePath{text-overflow:ellipsis;white-space:nowrap;overflow:hidden}.kxmlFa_dialogCheck{align-items:center;gap:8px;font-size:13px;display:flex}.kxmlFa_dialogWarning{color:var(--dsw-alias-state-error-primary);margin:0;font-size:12px}.kxmlFa_dialogActions{justify-content:flex-end;gap:8px;margin-top:4px;display:flex}.kxmlFa_dangerButton{cursor:pointer;border:1px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-state-error-primary);color:#fff;border-radius:9px;padding:7px 14px}.kxmlFa_dangerButton:disabled{opacity:.55;cursor:not-allowed}.kxmlFa_textButton[data-danger]{color:var(--dsw-alias-state-error-primary)}";
 		const tagId = "dsh-message-edit-enhanced/MessageEditTimelineView.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -989,79 +1059,93 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var MessageEditTimelineView_module_css_default = {
-			"versionItem": "kxmlFa_versionItem",
-			"status": "kxmlFa_status",
-			"turnFilterBar": "kxmlFa_turnFilterBar",
-			"diffLegend": "kxmlFa_diffLegend",
-			"versionDiffContent": "kxmlFa_versionDiffContent",
-			"headerActions": "kxmlFa_headerActions",
-			"turnHeader": "kxmlFa_turnHeader",
-			"versionListScroller": "kxmlFa_versionListScroller",
-			"versionTag": "kxmlFa_versionTag",
-			"columns": "kxmlFa_columns",
-			"title": "kxmlFa_title",
-			"root": "kxmlFa_root",
-			"primaryButton": "kxmlFa_primaryButton",
-			"versionDiff": "kxmlFa_versionDiff",
-			"messageTime": "kxmlFa_messageTime",
-			"cascadeField": "kxmlFa_cascadeField",
-			"subtitle": "kxmlFa_subtitle",
-			"pageHeader": "kxmlFa_pageHeader",
-			"effectControls": "kxmlFa_effectControls",
-			"empty": "kxmlFa_empty",
-			"turnSection": "kxmlFa_turnSection",
-			"secondaryButton": "kxmlFa_secondaryButton",
 			"versionButton": "kxmlFa_versionButton",
-			"versionsPanel": "kxmlFa_versionsPanel",
-			"versionNote": "kxmlFa_versionNote",
-			"currentBadge": "kxmlFa_currentBadge",
-			"textButton": "kxmlFa_textButton",
-			"optimisticText": "kxmlFa_optimisticText",
-			"sectionHeading": "kxmlFa_sectionHeading",
-			"diffDelete": "kxmlFa_diffDelete",
-			"error": "kxmlFa_error",
-			"versionDiffHeader": "kxmlFa_versionDiffHeader",
-			"effectDepth": "kxmlFa_effectDepth",
-			"turnList": "kxmlFa_turnList",
-			"versionDiffPanel": "kxmlFa_versionDiffPanel",
-			"diffEqual": "kxmlFa_diffEqual",
-			"versionMeta": "kxmlFa_versionMeta",
-			"optimisticKind": "kxmlFa_optimisticKind",
-			"versionLine": "kxmlFa_versionLine",
-			"editorHint": "kxmlFa_editorHint",
-			"editorActions": "kxmlFa_editorActions",
-			"versionList": "kxmlFa_versionList",
-			"textarea": "kxmlFa_textarea",
+			"pathBadge": "kxmlFa_pathBadge",
+			"status": "kxmlFa_status",
+			"versionDiff": "kxmlFa_versionDiff",
+			"diffInsert": "kxmlFa_diffInsert",
+			"subtitle": "kxmlFa_subtitle",
+			"fileList": "kxmlFa_fileList",
+			"filePath": "kxmlFa_filePath",
 			"effectButtons": "kxmlFa_effectButtons",
-			"turnPreview": "kxmlFa_turnPreview",
-			"versionDot": "kxmlFa_versionDot",
+			"currentBadge": "kxmlFa_currentBadge",
+			"turnHeader": "kxmlFa_turnHeader",
+			"effectDepth": "kxmlFa_effectDepth",
 			"slideDown": "kxmlFa_slideDown",
-			"intro": "kxmlFa_intro",
-			"notice": "kxmlFa_notice",
-			"count": "kxmlFa_count",
-			"editor": "kxmlFa_editor",
+			"versionTag": "kxmlFa_versionTag",
+			"versionTitle": "kxmlFa_versionTitle",
+			"textButton": "kxmlFa_textButton",
+			"sectionHeading": "kxmlFa_sectionHeading",
+			"turnSection": "kxmlFa_turnSection",
+			"turnTitle": "kxmlFa_turnTitle",
+			"turnPreview": "kxmlFa_turnPreview",
 			"messageCard": "kxmlFa_messageCard",
-			"optimisticMessage": "kxmlFa_optimisticMessage",
-			"optimisticPulse": "kxmlFa_optimisticPulse",
+			"dialogText": "kxmlFa_dialogText",
+			"dialogCheck": "kxmlFa_dialogCheck",
+			"error": "kxmlFa_error",
+			"messageText": "kxmlFa_messageText",
+			"cascadeField": "kxmlFa_cascadeField",
+			"filterBar": "kxmlFa_filterBar",
+			"dialogQuote": "kxmlFa_dialogQuote",
+			"editorActions": "kxmlFa_editorActions",
+			"versionListScroller": "kxmlFa_versionListScroller",
+			"primaryButton": "kxmlFa_primaryButton",
+			"headerActions": "kxmlFa_headerActions",
+			"versionMain": "kxmlFa_versionMain",
+			"versionExpand": "kxmlFa_versionExpand",
+			"versionLine": "kxmlFa_versionLine",
+			"versionMeta": "kxmlFa_versionMeta",
+			"messageHeader": "kxmlFa_messageHeader",
+			"messageList": "kxmlFa_messageList",
+			"editor": "kxmlFa_editor",
+			"count": "kxmlFa_count",
 			"filterSearch": "kxmlFa_filterSearch",
 			"filterChip": "kxmlFa_filterChip",
-			"messageList": "kxmlFa_messageList",
-			"versionPin": "kxmlFa_versionPin",
-			"versionTitle": "kxmlFa_versionTitle",
-			"pathBadge": "kxmlFa_pathBadge",
-			"kindBadge": "kxmlFa_kindBadge",
-			"select": "kxmlFa_select",
-			"diffInsert": "kxmlFa_diffInsert",
-			"versionTags": "kxmlFa_versionTags",
-			"messageText": "kxmlFa_messageText",
-			"turnsPanel": "kxmlFa_turnsPanel",
-			"versionExpand": "kxmlFa_versionExpand",
-			"versionMain": "kxmlFa_versionMain",
+			"versionDot": "kxmlFa_versionDot",
 			"filterChips": "kxmlFa_filterChips",
-			"turnTitle": "kxmlFa_turnTitle",
-			"messageHeader": "kxmlFa_messageHeader",
-			"filterBar": "kxmlFa_filterBar",
-			"messageEditOptimisticPulse": "kxmlFa_messageEditOptimisticPulse"
+			"title": "kxmlFa_title",
+			"notice": "kxmlFa_notice",
+			"intro": "kxmlFa_intro",
+			"versionDiffPanel": "kxmlFa_versionDiffPanel",
+			"versionsPanel": "kxmlFa_versionsPanel",
+			"columns": "kxmlFa_columns",
+			"versionDiffHeader": "kxmlFa_versionDiffHeader",
+			"textarea": "kxmlFa_textarea",
+			"effectControls": "kxmlFa_effectControls",
+			"diffEqual": "kxmlFa_diffEqual",
+			"diffLegend": "kxmlFa_diffLegend",
+			"versionDiffContent": "kxmlFa_versionDiffContent",
+			"versionNote": "kxmlFa_versionNote",
+			"optimisticMessage": "kxmlFa_optimisticMessage",
+			"versionList": "kxmlFa_versionList",
+			"optimisticKind": "kxmlFa_optimisticKind",
+			"optimisticText": "kxmlFa_optimisticText",
+			"dialogTitle": "kxmlFa_dialogTitle",
+			"diffDelete": "kxmlFa_diffDelete",
+			"fileRow": "kxmlFa_fileRow",
+			"editorHint": "kxmlFa_editorHint",
+			"dialogWarning": "kxmlFa_dialogWarning",
+			"pageHeader": "kxmlFa_pageHeader",
+			"turnsPanel": "kxmlFa_turnsPanel",
+			"dialogOverlay": "kxmlFa_dialogOverlay",
+			"empty": "kxmlFa_empty",
+			"messageEditOptimisticPulse": "kxmlFa_messageEditOptimisticPulse",
+			"fileChange": "kxmlFa_fileChange",
+			"versionTags": "kxmlFa_versionTags",
+			"dialog": "kxmlFa_dialog",
+			"dialogFacts": "kxmlFa_dialogFacts",
+			"turnList": "kxmlFa_turnList",
+			"turnFilterBar": "kxmlFa_turnFilterBar",
+			"select": "kxmlFa_select",
+			"optimisticPulse": "kxmlFa_optimisticPulse",
+			"versionItem": "kxmlFa_versionItem",
+			"messageTime": "kxmlFa_messageTime",
+			"root": "kxmlFa_root",
+			"secondaryButton": "kxmlFa_secondaryButton",
+			"versionPin": "kxmlFa_versionPin",
+			"dangerButton": "kxmlFa_dangerButton",
+			"dialogActions": "kxmlFa_dialogActions",
+			"kindBadge": "kxmlFa_kindBadge"
 		};
 		//#endregion
 		//#region src/client/MessageEditTimelineView.tsx
@@ -1134,13 +1218,15 @@ window.__ModuleLoader__.load({
 		const OPERATION_LABEL = {
 			edit: "Edit",
 			reroll: "Reroll",
-			retry: "Retry"
+			retry: "Retry",
+			delete: "Delete"
 		};
 		const FILTER_LABEL = {
 			all: "All",
 			edit: "Edit",
 			reroll: "Reroll",
 			retry: "Retry",
+			delete: "Delete",
 			current: "Current",
 			"on-path": "On Path",
 			pinned: "Pinned"
@@ -1337,7 +1423,7 @@ window.__ModuleLoader__.load({
 				})]
 			});
 		}
-		function MessageCard({ message, editing, disabled, cascade, onBeginEdit, onCancelEdit, onTextChange, onApplyEdit }) {
+		function MessageCard({ message, editing, disabled, cascade, onBeginEdit, onCancelEdit, onTextChange, onApplyEdit, onDelete }) {
 			const active = editing?.message.key === message.key;
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("article", {
 				className: MessageEditTimelineView_module_css_default["messageCard"],
@@ -1361,6 +1447,17 @@ window.__ModuleLoader__.load({
 								active ? onCancelEdit() : onBeginEdit(message);
 							},
 							children: active ? "Cancel" : "Edit"
+						}),
+						onDelete === null || message.kind !== "user" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: MessageEditTimelineView_module_css_default["textButton"],
+							"data-danger": true,
+							disabled,
+							title: "Delete this exchange and revert its workspace changes",
+							onClick: () => {
+								onDelete?.(message);
+							},
+							children: "Delete"
 						})
 					]
 				}), active && editing !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -1395,7 +1492,7 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/** Conversation-view entry point. */
-		function MessageEditTimelineView({ useMessageEdit, acquire, load, edit, retry, reroll, openVersion, exportBranch }) {
+		function MessageEditTimelineView({ useMessageEdit, acquire, load, edit, retry, reroll, previewDelete, deleteMessage, openVersion, exportBranch }) {
 			const state = useMessageEdit((value) => value);
 			const [cascade, setCascade] = (0, react.useState)("truncate");
 			const [editing, setEditing] = (0, react.useState)(null);
@@ -1404,6 +1501,34 @@ window.__ModuleLoader__.load({
 			const [turnSearch, setTurnSearch] = (0, react.useState)("");
 			const [versionMeta, setVersionMeta] = (0, react.useState)(() => loadVersionMeta());
 			const [exportFormat, setExportFormat] = (0, react.useState)("json");
+			const [deleteTarget, setDeleteTarget] = (0, react.useState)(null);
+			const [deletePreviewData, setDeletePreviewData] = (0, react.useState)(null);
+			const [deletePreviewError, setDeletePreviewError] = (0, react.useState)(null);
+			const [deleteRollback, setDeleteRollback] = (0, react.useState)(true);
+			const [deleteBusy, setDeleteBusy] = (0, react.useState)(false);
+			/** Open the confirmation dialog and fetch the read-only impact report. */
+			const requestDelete = (message) => {
+				setDeleteTarget(message);
+				setDeletePreviewData(null);
+				setDeletePreviewError(null);
+				setDeleteRollback(true);
+				previewDelete(message.eventSeq).then((report) => {
+					setDeletePreviewData(report);
+					setDeleteRollback(report.checkpointFound);
+				}).catch((error) => {
+					setDeletePreviewError(error instanceof Error ? error.message : String(error));
+				});
+			};
+			const confirmDelete = () => {
+				if (deleteTarget === null || deleteBusy) return;
+				setDeleteBusy(true);
+				const rollbackWorkspace = deleteRollback && (deletePreviewData?.checkpointFound ?? false);
+				deleteMessage(deleteTarget.eventSeq, rollbackWorkspace).finally(() => {
+					setDeleteBusy(false);
+					setDeleteTarget(null);
+					setDeletePreviewData(null);
+				});
+			};
 			(0, react.useEffect)(() => {
 				saveVersionMeta(versionMeta);
 			}, [versionMeta]);
@@ -1770,7 +1895,8 @@ window.__ModuleLoader__.load({
 														text
 													});
 												},
-												onApplyEdit: applyEdit
+												onApplyEdit: applyEdit,
+												onDelete: requestDelete
 											}, message.key))
 										})]
 									}, section.retry.turn)), state.optimisticEdit === null ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
@@ -1810,6 +1936,137 @@ window.__ModuleLoader__.load({
 								})
 							]
 						})]
+					}),
+					deleteTarget === null ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: MessageEditTimelineView_module_css_default["dialogOverlay"],
+						role: "presentation",
+						onClick: () => {
+							if (!deleteBusy) setDeleteTarget(null);
+						},
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: MessageEditTimelineView_module_css_default["dialog"],
+							role: "dialog",
+							"aria-modal": "true",
+							"aria-label": "Delete message",
+							onClick: (event) => {
+								event.stopPropagation();
+							},
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", {
+									className: MessageEditTimelineView_module_css_default["dialogTitle"],
+									children: "Delete this message?"
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: MessageEditTimelineView_module_css_default["dialogText"],
+									children: "This will delete the user message, its response, and revert any code changes caused by this exchange."
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("pre", {
+									className: MessageEditTimelineView_module_css_default["dialogQuote"],
+									children: deleteTarget.text || "(empty)"
+								}),
+								deletePreviewData === null && deletePreviewError === null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: MessageEditTimelineView_module_css_default["dialogText"],
+									children: "Checking impact…"
+								}) : null,
+								deletePreviewError !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+									className: MessageEditTimelineView_module_css_default["dialogWarning"],
+									children: ["Impact check failed: ", deletePreviewError]
+								}) : null,
+								deletePreviewData !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("ul", {
+										className: MessageEditTimelineView_module_css_default["dialogFacts"],
+										children: [
+											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", { children: [
+												"Removes turn ",
+												String(deletePreviewData.turn),
+												deletePreviewData.laterTurns.length > 0 ? ` and ${String(deletePreviewData.laterTurns.length)} later exchange(s) (turn ${deletePreviewData.laterTurns.map((t) => String(t)).join(", ")})` : "",
+												"."
+											] }),
+											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", { children: [
+												deletePreviewData.willBranch ? "This session is not live, so the deletion will create a branch without these exchanges." : "The exchanges are removed from this conversation in place.",
+												" ",
+												"The full history stays in the session log as an audit trail."
+											] }),
+											deletePreviewData.checkpointFound ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", { children: [
+												"Workspace snapshot found (",
+												deletePreviewData.workspacePath,
+												"):",
+												" ",
+												String(deletePreviewData.filesToRevert.length),
+												" file(s) to revert,",
+												" ",
+												String(deletePreviewData.filesToRemove.length),
+												" created-after file(s) to remove."
+											] }) : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", { children: [
+												"No workspace snapshot for this message",
+												deletePreviewData.checkpointReason === void 0 ? "" : `: ${deletePreviewData.checkpointReason}`,
+												". Code changes cannot be reverted automatically."
+											] })
+										]
+									}),
+									(deletePreviewData.filesToRevert.length > 0 || deletePreviewData.filesToRemove.length > 0) && deleteRollback ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: MessageEditTimelineView_module_css_default["fileList"],
+										children: [[...deletePreviewData.filesToRevert, ...deletePreviewData.filesToRemove].slice(0, 8).map((file) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: MessageEditTimelineView_module_css_default["fileRow"],
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: MessageEditTimelineView_module_css_default["fileChange"],
+												"data-change": file.change,
+												children: file.change === "revert" ? "revert" : "remove"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", {
+												className: MessageEditTimelineView_module_css_default["filePath"],
+												children: file.path
+											})]
+										}, `${file.change}:${file.path}`)), deletePreviewData.filesToRevert.length + deletePreviewData.filesToRemove.length > 8 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: MessageEditTimelineView_module_css_default["fileRow"],
+											children: [
+												"…and ",
+												String(deletePreviewData.filesToRevert.length + deletePreviewData.filesToRemove.length - 8),
+												" more"
+											]
+										}) : null]
+									}) : null,
+									deletePreviewData.skipped.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+										className: MessageEditTimelineView_module_css_default["dialogText"],
+										children: [String(deletePreviewData.skipped.length), " binary/oversized file(s) are left untouched."]
+									}) : null,
+									deletePreviewData.checkpointFound ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+										className: MessageEditTimelineView_module_css_default["dialogCheck"],
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+											type: "checkbox",
+											checked: deleteRollback,
+											disabled: deleteBusy,
+											onChange: (event) => {
+												setDeleteRollback(event.currentTarget.checked);
+											}
+										}), "Also revert workspace changes from this exchange"]
+									}) : null,
+									deletePreviewData.warnings.map((warning, index) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+										className: MessageEditTimelineView_module_css_default["dialogWarning"],
+										children: warning
+									}, index))
+								] }) : null,
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: MessageEditTimelineView_module_css_default["dialogActions"],
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: MessageEditTimelineView_module_css_default["secondaryButton"],
+										disabled: deleteBusy,
+										onClick: () => {
+											setDeleteTarget(null);
+										},
+										children: "Cancel"
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: MessageEditTimelineView_module_css_default["dangerButton"],
+										disabled: deleteBusy || deleteRollback && deletePreviewError !== null,
+										onClick: () => {
+											confirmDelete();
+										},
+										children: deleteBusy ? "Deleting…" : "Delete"
+									})]
+								})
+							]
+						})
 					})
 				]
 			});

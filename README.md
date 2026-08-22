@@ -51,6 +51,16 @@ This path does not touch `ReactLoopAgent`, AgentLoop private methods, or apiprox
 - Timeline and header share a value-level Snapshot source keyed by `sessionId`; the controller reactively subscribes to the current Session's closed turn values and the lineage values in the Session list, rebinding when the Session identity is replaced without caching the old Session object.
 - New version navigation waits for the runtime Session list to publish the corresponding ID before executing `ctx.sessions.open()`, with availability changes directly driving navigation.
 
+## Deleting Messages (workspace rollback)
+
+The Delete control on settled user messages removes the whole exchange — the message, its response, and every later exchange that causally depends on them.
+
+- Before each user message is processed, the plugin snapshots the attached workspace (path→hash manifest plus content-addressed file copies) into `<DSH_HOME>/message-edit-enhanced/checkpoints/`.
+- Deleting rolls the workspace back to the snapshot taken immediately before that message: modified files are reverted, files deleted since are restored, and files created since are removed.
+- A confirmation dialog always shows the affected turns and the exact file list first. If no snapshot exists for the message, workspace changes cannot be reverted automatically and the dialog says so; you can still delete just the chat exchange.
+- Rollback runs before the conversation is truncated: if file restoration fails, the chat is left unchanged and the operation can be retried safely (it is idempotent).
+- Deletions are recorded in `checkpoints/audit.log`, and the append-only session log retains the removed exchanges as a recovery trail. Sessions without a live agent branch instead of truncating.
+
 ## Stability & Performance
 
 - **Busy-agent guard**: edit/retry/reroll buttons disable while the session's agent is streaming; the host also maps `runMaintenance`'s "already has active work" to a typed `409 agent-busy` with a friendly message.

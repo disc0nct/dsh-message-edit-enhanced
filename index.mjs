@@ -1,3 +1,329 @@
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+//#region src/workspace-checkpoints.ts
+/**
+* Workspace checkpointing for cascading message deletion.
+*
+* Every time a `user/message` lands in any session, this module captures a
+* best-effort snapshot of the workspace the session is attached to: a full
+* path→content-hash manifest plus content-addressed text blobs. Deleting a
+* message later restores exactly that pre-message state.
+*
+* Storage layout (plugin-owned, inside the DSH home — never inside a user
+* workspace):
+*   <root>/manifests/<sessionId>/<seq>.json   one full tree manifest per user message
+*   <root>/blobs/<hash[0:2]>/<hash>           deduplicated file contents
+*   <root>/audit.log                          JSONL audit trail of deletions
+*
+* Workspace reads/writes go through the injected `fs` service (atomic writes,
+* policy-respecting); only unlinking files created after a checkpoint falls
+* back to contained `node:fs` removal because the service has no delete API.
+*/
+function fsOf(ctx) {
+	return ctx.get("fs");
+}
+function sourceWorkspaceOf(ctx, sessionId) {
+	const registry = ctx.get("workspaceRegistry");
+	if (registry === void 0) return void 0;
+	return registry.list().find((workspace) => workspace.sessionIds.includes(sessionId));
+}
+const MANIFEST_VERSION = 1;
+const MAX_DEPTH = 12;
+const MAX_FILES = 4e3;
+const MAX_FILE_BYTES = 524288;
+const MAX_CAPTURE_BYTES = 25165824;
+const IGNORED_NAMES = /* @__PURE__ */ new Set([
+	".git",
+	".hg",
+	".svn",
+	".dsh",
+	".cache",
+	".next",
+	".nuxt",
+	"node_modules",
+	"dist",
+	"build",
+	"out",
+	"target",
+	"vendor",
+	"coverage",
+	"__pycache__",
+	".venv",
+	"venv",
+	".tox",
+	".mypy_cache"
+]);
+function checkpointRoot() {
+	const raw = process.env["DSH_HOME"];
+	const home = raw !== void 0 && raw.trim() !== "" ? raw.trim() : join(homedir(), ".dsh");
+	return join(home, "message-edit-enhanced", "checkpoints");
+}
+function safeSegment(value) {
+	return value.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+function manifestFile(sessionId, seq) {
+	return join(checkpointRoot(), "manifests", safeSegment(sessionId), `${String(seq)}.json`);
+}
+function blobFile(hash) {
+	return join(checkpointRoot(), "blobs", hash.slice(0, 2), hash);
+}
+function hashText(content) {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+async function writeAtomic(file, data) {
+	await mkdir(dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	await writeFile(temp, data, "utf8");
+	await rename(temp, file);
+}
+async function readBlob(hash) {
+	return readFile(blobFile(hash), "utf8");
+}
+async function blobExists(hash) {
+	try {
+		await stat(blobFile(hash));
+		return true;
+	} catch {
+		return false;
+	}
+}
+/** Per-session capture serialization: walks never interleave for one session. */
+const captureChains = /* @__PURE__ */ new Map();
+function chainCapture(sessionId, task) {
+	const next = (captureChains.get(sessionId) ?? Promise.resolve()).then(task, task);
+	captureChains.set(sessionId, next);
+	next.catch(() => {}).finally(() => {
+		if (captureChains.get(sessionId) === next) captureChains.delete(sessionId);
+	});
+}
+/** Walk the workspace through the injected fs service, hashing every readable
+* text file. Relative paths are built during the walk so any backend's opaque
+* display paths stay out of the stored keys. */
+async function snapshotTree(ctx, workspacePath) {
+	const fs = fsOf(ctx);
+	if (fs === void 0) throw new Error("Filesystem service is not available.");
+	const result = {
+		files: {},
+		fileCount: 0,
+		contents: /* @__PURE__ */ new Map(),
+		skipped: [],
+		warnings: []
+	};
+	const rootTarget = await fs.resolve(workspacePath);
+	let budget = MAX_CAPTURE_BYTES;
+	const visit = async (target, relBase, depth) => {
+		if (result.fileCount >= MAX_FILES || budget <= 0 || depth > MAX_DEPTH) return;
+		const children = await fs.listDir(target);
+		for (const child of children) {
+			if (result.fileCount >= MAX_FILES || budget <= 0) return;
+			const rel = relBase === "" ? child.name : `${relBase}/${child.name}`;
+			if (child.type === "directory") {
+				if (!IGNORED_NAMES.has(child.name)) await visit(child.target, rel, depth + 1);
+				continue;
+			}
+			if (child.type !== "file") continue;
+			if ((child.size ?? 0) > MAX_FILE_BYTES) {
+				result.skipped.push({
+					path: rel,
+					reason: "too-large"
+				});
+				continue;
+			}
+			let content;
+			try {
+				content = await fs.readText(child.target);
+			} catch {
+				result.skipped.push({
+					path: rel,
+					reason: "binary"
+				});
+				continue;
+			}
+			if (content.length > MAX_FILE_BYTES || content.length > budget) {
+				result.skipped.push({
+					path: rel,
+					reason: "too-large"
+				});
+				continue;
+			}
+			budget -= content.length;
+			const hash = hashText(content);
+			result.files[rel] = hash;
+			result.fileCount += 1;
+			if (!await blobExists(hash)) result.contents.set(hash, content);
+		}
+	};
+	await visit(rootTarget, "", 0);
+	if (result.fileCount >= MAX_FILES) result.warnings.push(`Workspace tree exceeds ${String(MAX_FILES)} files; snapshot covers the first ${String(MAX_FILES)}.`);
+	return result;
+}
+/** Capture the pre-message workspace state for one appended user message.
+* Fire-and-forget safe: every failure is logged, never thrown into the feed. */
+function captureCheckpoint(ctx, sessionId, seq) {
+	chainCapture(sessionId, async () => {
+		try {
+			const workspace = sourceWorkspaceOf(ctx, sessionId);
+			if (workspace === void 0) return;
+			const tree = await snapshotTree(ctx, workspace.path);
+			for (const [hash, content] of tree.contents) await writeAtomic(blobFile(hash), content);
+			const manifest = {
+				v: MANIFEST_VERSION,
+				sessionId,
+				seq,
+				time: Date.now(),
+				workspaceId: workspace.id,
+				workspacePath: workspace.path,
+				files: tree.files
+			};
+			await writeAtomic(manifestFile(sessionId, seq), JSON.stringify(manifest));
+		} catch (error) {
+			console.error("[message-edit-enhanced] checkpoint capture failed:", error);
+		}
+	});
+}
+function isManifest(value) {
+	if (typeof value !== "object" || value === null) return null;
+	const record = value;
+	if (record["v"] !== MANIFEST_VERSION) return null;
+	if (typeof record["sessionId"] !== "string") return null;
+	if (typeof record["workspacePath"] !== "string") return null;
+	if (typeof record["seq"] !== "number" || typeof record["workspaceId"] !== "string") return null;
+	if (typeof record["files"] !== "object" || record["files"] === null) return null;
+	return value;
+}
+async function loadManifestFile(sessionId, seq) {
+	try {
+		return isManifest(JSON.parse(await readFile(manifestFile(sessionId, seq), "utf8")));
+	} catch {
+		return null;
+	}
+}
+/** Load the exact checkpoint captured before the given user message event. */
+async function loadCheckpoint(sessionId, seq) {
+	return loadManifestFile(sessionId, seq);
+}
+/** Build a read-only rollback plan for deleting everything from `eventSeq` on.
+* Never mutates anything. Requires the EXACT checkpoint for the target event:
+* restoring an older checkpoint would also revert preserved earlier exchanges. */
+async function planRollback(ctx, sessionId, eventSeq) {
+	const unavailable = (reason) => ({
+		available: false,
+		reason,
+		filesToWrite: [],
+		filesToRemove: [],
+		skipped: [],
+		warnings: []
+	});
+	const manifest = await loadManifestFile(sessionId, eventSeq);
+	if (manifest === null) return unavailable("No workspace checkpoint exists for this message.");
+	const workspace = sourceWorkspaceOf(ctx, sessionId);
+	if (workspace === void 0) return unavailable("The session is not attached to a registered workspace.");
+	if (fsOf(ctx) === void 0) return unavailable("The filesystem service is not available.");
+	if (workspace.path !== manifest.workspacePath) return unavailable(`Snapshot recorded workspace ${manifest.workspacePath}, which no longer matches ${workspace.path}.`);
+	const current = await snapshotTree(ctx, workspace.path);
+	const filesToWrite = [];
+	for (const [path, hash] of Object.entries(manifest.files)) {
+		if (current.files[path] === hash) continue;
+		filesToWrite.push({
+			path,
+			hash
+		});
+	}
+	const plan = {
+		available: true,
+		manifest,
+		filesToWrite: filesToWrite.sort((a, b) => a.path.localeCompare(b.path)),
+		filesToRemove: Object.keys(current.files).filter((path) => manifest.files[path] === void 0).sort((a, b) => a.localeCompare(b)),
+		skipped: current.skipped,
+		warnings: []
+	};
+	if (current.fileCount >= MAX_FILES || current.skipped.length > 0) plan.warnings.push("Some files were not covered by the snapshot (binary, oversized, or ignored paths); they will be left untouched.");
+	return plan;
+}
+function assertContained(workspacePath, rel) {
+	if (rel.length === 0 || isAbsolute(rel) || rel.split("/").includes("..")) throw new Error(`Refusing to touch a path outside the workspace: ${rel}`);
+	const absolute = resolve(workspacePath, ...rel.split("/"));
+	const root = resolve(workspacePath);
+	if (!(absolute + sep).startsWith(root + sep)) throw new Error(`Refusing to touch a path outside the workspace: ${rel}`);
+	return absolute;
+}
+/** Restore the workspace to the planned checkpoint state. Best-effort per file:
+* individual failures are collected so callers can report partial progress;
+* every restore payload is pre-loaded BEFORE anything is mutated. */
+async function applyRollback(ctx, plan, workspacePath) {
+	const outcome = {
+		reverted: 0,
+		removed: 0,
+		failures: []
+	};
+	const fs = fsOf(ctx);
+	if (fs === void 0 || plan.manifest === void 0) {
+		outcome.failures.push({
+			path: "*",
+			error: "Rollback prerequisites are missing."
+		});
+		return outcome;
+	}
+	const payloads = /* @__PURE__ */ new Map();
+	for (const entry of plan.filesToWrite) try {
+		payloads.set(entry.hash, await readBlob(entry.hash));
+	} catch (error) {
+		outcome.failures.push({
+			path: entry.path,
+			error: `checkpoint blob missing: ${error instanceof Error ? error.message : String(error)}`
+		});
+	}
+	if (outcome.failures.length > 0) return outcome;
+	for (const entry of plan.filesToWrite) {
+		const content = payloads.get(entry.hash);
+		if (content === void 0) continue;
+		try {
+			const absolute = assertContained(workspacePath, entry.path);
+			await mkdir(dirname(absolute), { recursive: true });
+			const target = await fs.resolve(join(workspacePath, entry.path));
+			await fs.writeText(target, content);
+			outcome.reverted += 1;
+		} catch (error) {
+			outcome.failures.push({
+				path: entry.path,
+				error: error instanceof Error ? error.message : String(error)
+			});
+		}
+	}
+	for (const rel of plan.filesToRemove) try {
+		await rm(assertContained(workspacePath, rel), { force: true });
+		outcome.removed += 1;
+	} catch (error) {
+		outcome.failures.push({
+			path: rel,
+			error: error instanceof Error ? error.message : String(error)
+		});
+	}
+	return outcome;
+}
+/** Append one JSONL audit record; returns the audit id carried in results. */
+async function appendAuditEntry(entry) {
+	const auditId = `audit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	try {
+		const line = `${JSON.stringify({
+			auditId,
+			time: Date.now(),
+			...entry
+		})}\n`;
+		const file = join(checkpointRoot(), "audit.log");
+		await mkdir(dirname(file), { recursive: true });
+		await writeFile(file, line, {
+			flag: "a",
+			encoding: "utf8"
+		});
+	} catch (error) {
+		console.error("[message-edit-enhanced] audit write failed:", error);
+	}
+	return auditId;
+}
+//#endregion
 //#region src/shared.ts
 /** Same-origin endpoint owned by the Message Edit host plugin. */
 const MESSAGE_EDIT_PATH = "/message-edit-enhanced";
@@ -27,7 +353,7 @@ const sessionOperationQueues = /* @__PURE__ */ new Map();
 function serializeSessionOperation(sessionId, task) {
 	const next = (sessionOperationQueues.get(sessionId) ?? Promise.resolve()).then(() => task(), () => task());
 	sessionOperationQueues.set(sessionId, next);
-	next.finally(() => {
+	next.catch(() => {}).finally(() => {
 		if (sessionOperationQueues.get(sessionId) === next) sessionOperationQueues.delete(sessionId);
 	});
 	return next;
@@ -273,12 +599,31 @@ function rerollPlan(sessionId, turns) {
 	}
 	throw new Error("Current session has no settled assistant reply to regenerate.");
 }
+/** Branch plan that ends just before the deleted exchange (fork fallback for
+* sessions without a live agent; the original session keeps its history). */
+function deletePlan(operation, turns) {
+	const turn = turns.find((candidate) => candidate.user?.seq === operation.eventSeq);
+	if (turn === void 0) throw new Error("Selected message is not a settled user message.");
+	return {
+		boundary: turn.startSeq - 1,
+		version: pairVersionEffect(operation.sessionId, {
+			operation: "delete",
+			cascade: "truncate",
+			targetTurn: turn.turn,
+			targetEventSeq: operation.eventSeq,
+			blockKind: "user",
+			...turn.user === void 0 ? {} : { before: userText(turn.user.data) }
+		}),
+		queuedUsers: []
+	};
+}
 function planOperation(operation, events) {
 	const turns = closedTurns(events);
 	switch (operation.action) {
 		case "edit": return editPlan(operation, turns);
 		case "reroll": return rerollPlan(operation.sessionId, turns);
 		case "retry": return retryPlan(operation.sessionId, operation.turn, operation.cascade, turns);
+		case "delete": return deletePlan(operation, turns);
 	}
 }
 function agentOptions(events, fallback) {
@@ -516,8 +861,173 @@ async function runForkOperation(ctx, source, sourceId, events, operation) {
 		throw error;
 	}
 }
+/** In-place delete requires the same live prerequisites as in-place edit:
+* a live session, a live agent for the followup-free truncation, and the
+* target user message still on the active surface. */
+function isInPlaceDeleteEligible(ctx, sourceId, operation) {
+	const sourceSession = ctx.sessions.get(sourceId);
+	if (sourceSession === void 0) return false;
+	if (ctx.agents.get(sourceId) === void 0) return false;
+	if (sourceSession.events[operation.eventSeq]?.type !== "user/message") return false;
+	return sourceSession.surface.nodes.includes(operation.eventSeq);
+}
+/** Delete a settled user message exchange IN PLACE: truncate the surface from
+* the target message to the end (one empty replacement node, no regeneration),
+* after rolling the workspace back to the checkpoint taken before the message.
+* Rollback-first ordering keeps the conversation untouched when files fail. */
+async function runInPlaceDelete(ctx, sourceId, operation) {
+	const agent = ctx.agents.get(sourceId);
+	if (agent === void 0) throw new Error("Session agent is not live; cannot delete in place.");
+	return agent.runMaintenance(async () => {
+		const session = agent.session;
+		const events = session.events;
+		const turns = closedTurns(events);
+		const turnIndex = turns.findIndex((turn) => turn.user?.seq === operation.eventSeq);
+		const turn = turns[turnIndex];
+		if (turn === void 0 || turn.user === void 0) {
+			if (events[operation.eventSeq]?.type === "user/message") return {
+				sessionId: session.id,
+				queuedTurns: 0,
+				alreadyDeleted: true
+			};
+			throw new Error("Selected message is not a settled user message.");
+		}
+		const removedTurns = turns.slice(turnIndex).map((candidate) => candidate.turn);
+		let revertedFiles = 0;
+		let removedFiles = 0;
+		let skippedFiles = 0;
+		let workspaceRolledBack = false;
+		if (operation.rollbackWorkspace) {
+			const plan = await planRollback(ctx, sourceId, operation.eventSeq);
+			if (!plan.available || plan.manifest === void 0) throw new Error(`Workspace rollback is not available: ${plan.reason ?? "no checkpoint"}`);
+			const outcome = await applyRollback(ctx, plan, plan.manifest.workspacePath);
+			if (outcome.failures.length > 0) {
+				const detail = outcome.failures.slice(0, 5).map((f) => `${f.path}: ${f.error}`).join("; ");
+				throw new Error(`Workspace rollback failed on ${String(outcome.failures.length)} file(s); the conversation was left unchanged. Retry once file access is restored (${detail}${outcome.failures.length > 5 ? "; …" : ""})`);
+			}
+			revertedFiles = outcome.reverted;
+			removedFiles = outcome.removed;
+			skippedFiles = plan.skipped.length;
+			workspaceRolledBack = true;
+		}
+		const nodes = session.surface.nodes;
+		const startIdx = nodes.indexOf(operation.eventSeq);
+		if (startIdx === -1) throw new Error("Target message is no longer on the conversation surface.");
+		const shadowed = nodes.slice(startIdx);
+		const start = shadowed[0];
+		const end = shadowed[shadowed.length - 1];
+		if (start === void 0 || end === void 0) throw new Error("Target message has no surface span to delete.");
+		const options = agentOptions(events, agent.options);
+		const provider = options.provider;
+		const model = options.model;
+		if (provider === void 0 || model === void 0) throw new Error("Unable to resolve model route for in-place delete.");
+		const nextTurn = (turns.at(-1)?.turn ?? 0) + 1;
+		const emptyMessage = Object.freeze({
+			id: crypto.randomUUID(),
+			role: "assistant",
+			content: Object.freeze([]),
+			source: Object.freeze({
+				kind: "model",
+				provider,
+				model
+			})
+		});
+		session.append("assistant/message", {
+			turn: nextTurn,
+			step: 1,
+			message: emptyMessage
+		}, {
+			surfaceOp: {
+				op: "replace",
+				start,
+				end
+			},
+			sourceEventSeqs: [...shadowed]
+		});
+		try {
+			await ctx.sessions.flush(session);
+		} catch (error) {
+			console.warn("In-place delete: flush failed; truncation stays in memory until the next boundary.", error);
+		}
+		const auditId = await appendAuditEntry({
+			kind: "delete",
+			sessionId: session.id,
+			eventSeq: operation.eventSeq,
+			turn: turn.turn,
+			removedTurns,
+			revertedFiles,
+			removedFiles,
+			skippedFiles,
+			rollbackWorkspace: operation.rollbackWorkspace
+		});
+		return {
+			sessionId: session.id,
+			queuedTurns: 0,
+			delete: {
+				removedTurns,
+				revertedFiles,
+				removedFiles,
+				skippedFiles,
+				workspaceRolledBack,
+				auditId
+			}
+		};
+	});
+}
+/** Read-only impact report for the confirmation dialog. */
+async function deletePreview(ctx, sourceId, eventSeq) {
+	const turns = closedTurns(await readCurrentLog(ctx, sourceId));
+	const turnIndex = turns.findIndex((turn) => turn.user?.seq === eventSeq);
+	const turn = turns[turnIndex];
+	if (turn === void 0 || turn.user === void 0) throw new Error("Selected message is not a settled user message.");
+	const laterTurns = turns.slice(turnIndex + 1).map((candidate) => candidate.turn);
+	const liveSession = ctx.sessions.get(sourceId) !== void 0;
+	const liveAgent = ctx.agents.get(sourceId) !== void 0;
+	const preview = {
+		sessionId: sourceId,
+		eventSeq,
+		turn: turn.turn,
+		preview: userText(turn.user.data),
+		laterTurns,
+		willBranch: !liveSession || !liveAgent,
+		checkpointFound: false,
+		filesToRevert: [],
+		filesToRemove: [],
+		skipped: [],
+		warnings: []
+	};
+	if (preview.willBranch) preview.warnings.push("This session is not active right now, so deleting will create a branch without the deleted exchanges instead of truncating this conversation.");
+	try {
+		const plan = await planRollback(ctx, sourceId, eventSeq);
+		if (plan.available && plan.manifest !== void 0) {
+			preview.checkpointFound = true;
+			preview.workspacePath = plan.manifest.workspacePath;
+			preview.filesToRevert = plan.filesToWrite.map((entry) => ({
+				path: entry.path,
+				change: "revert"
+			}));
+			preview.filesToRemove = plan.filesToRemove.map((path) => ({
+				path,
+				change: "remove"
+			}));
+			preview.skipped = plan.skipped;
+			preview.warnings.push(...plan.warnings);
+		} else {
+			if (plan.reason !== void 0) preview.checkpointReason = plan.reason;
+			preview.warnings.push("No pre-message workspace snapshot exists, so code changes from this exchange cannot be reverted automatically.");
+		}
+	} catch (error) {
+		preview.checkpointReason = error instanceof Error ? error.message : String(error);
+		preview.warnings.push("The workspace could not be inspected for a rollback plan.");
+	}
+	return preview;
+}
 async function runOperation(ctx, operation) {
 	const sourceId = sessionIdOf(operation.sessionId);
+	if (operation.action === "delete") {
+		if (isInPlaceDeleteEligible(ctx, sourceId, operation)) return runInPlaceDelete(ctx, sourceId, operation);
+		return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation));
+	}
 	if (operation.action === "edit" && isInPlaceEligible(ctx, sourceId, operation)) return runInPlaceEdit(ctx, sourceId, operation);
 	return withSourceAgent(ctx, sourceId, async (source) => runForkOperation(ctx, source, sourceId, source.session.events, operation));
 }
@@ -729,7 +1239,13 @@ function decodeOperation(value) {
 			turn: integerOf(record["turn"], "turn"),
 			cascade: cascadeOf(record["cascade"])
 		};
-		default: throw new TypeError("action must be 'edit', 'reroll', or 'retry'.");
+		case "delete": return {
+			action: "delete",
+			sessionId,
+			eventSeq: integerOf(record["eventSeq"], "eventSeq"),
+			rollbackWorkspace: record["rollbackWorkspace"] !== false
+		};
+		default: throw new TypeError("action must be 'edit', 'reroll', 'retry', or 'delete'.");
 	}
 }
 function requestJson(request) {
@@ -757,6 +1273,16 @@ function respondJson(response, status, value) {
 	});
 	response.end(JSON.stringify(value));
 }
+/** Serve GET <MESSAGE_EDIT_PATH>/delete-preview for the confirmation dialog. */
+async function handleDeletePreviewRoute(ctx, request, response) {
+	try {
+		const url = new URL(request.url ?? "/message-edit-enhanced", "http://message-edit-enhanced.local");
+		respondJson(response, 200, await deletePreview(ctx, sessionIdOf(url.searchParams.get("sessionId")), integerOf(Number.parseInt(url.searchParams.get("eventSeq") ?? "", 10), "eventSeq")));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		respondJson(response, error instanceof TypeError ? 400 : 409, { error: message });
+	}
+}
 async function handleRoute(ctx, request, response) {
 	try {
 		if (request.method === "GET") {
@@ -783,13 +1309,23 @@ async function handleRoute(ctx, request, response) {
 		});
 	}
 }
-/** Register the reversible route contribution. */
+/** Register the reversible route contributions and the checkpoint capture feed. */
 function apply(ctx) {
 	ctx.effect(() => ctx.webServer.register({
 		kind: "exact",
 		path: MESSAGE_EDIT_PATH,
 		handler: (request, response) => handleRoute(ctx, request, response)
 	}), "message-edit-enhanced: HTTP route");
+	ctx.effect(() => ctx.webServer.register({
+		kind: "exact",
+		path: `${MESSAGE_EDIT_PATH}/delete-preview`,
+		handler: (request, response) => handleDeletePreviewRoute(ctx, request, response)
+	}), "message-edit-enhanced: delete-preview route");
+	ctx.effect(() => ctx.on("session/event", (session, event) => {
+		if (event.type !== "user/message") return;
+		if (event.data.source?.kind !== "user") return;
+		captureCheckpoint(ctx, session.id, event.seq);
+	}), "message-edit-enhanced: workspace checkpoint capture");
 }
 //#endregion
-export { MESSAGE_EDIT_PATH, MESSAGE_EDIT_VERSION_SCHEMA, MESSAGE_EDIT_VIEW_ORDER, apply, inject, name, runOperation };
+export { MESSAGE_EDIT_PATH, MESSAGE_EDIT_VERSION_SCHEMA, MESSAGE_EDIT_VIEW_ORDER, appendAuditEntry, apply, applyRollback, captureCheckpoint, inject, loadCheckpoint, name, planRollback, runOperation };

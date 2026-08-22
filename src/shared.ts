@@ -8,7 +8,7 @@ export const MESSAGE_EDIT_VIEW_ORDER = 15
 export type CascadePolicy = 'truncate' | 'preserve'
 
 /** User-visible operation represented by one child version. */
-export type VersionOperation = 'edit' | 'reroll' | 'retry'
+export type VersionOperation = 'edit' | 'reroll' | 'retry' | 'delete'
 
 /** Editable model-surface block classification. */
 export type EditableBlockKind = 'user' | 'assistant.reasoning' | 'assistant.response'
@@ -131,11 +131,68 @@ export interface RetryOperation {
  cascade: CascadePolicy
 }
 
+/** Delete a settled user message, its response, and every later exchange;
+ * optionally revert the workspace to the checkpoint taken before the message. */
+export interface DeleteOperation {
+ action: 'delete'
+ sessionId: string
+ eventSeq: number
+ /** Apply the workspace file rollback in addition to removing the exchanges. */
+ rollbackWorkspace: boolean
+}
+
 /** Mutation accepted by the host route. */
-export type MessageEditOperation = EditOperation | RerollOperation | RetryOperation
+export type MessageEditOperation = EditOperation | RerollOperation | RetryOperation | DeleteOperation
+
+/** One workspace file affected by a delete rollback. */
+export interface DeletePreviewFile {
+ /** Workspace-relative path. */
+ path: string
+ change: 'revert' | 'remove'
+}
+
+/** One file the snapshot could not cover. */
+export interface DeleteSkippedFile {
+ path: string
+ reason: 'binary' | 'too-large'
+}
+
+/** Read-only impact report backing the delete confirmation dialog. */
+export interface MessageEditDeletePreview {
+ sessionId: string
+ eventSeq: number
+ turn: number
+ preview: string
+ /** Turns removed after the target exchange (the target itself excluded). */
+ laterTurns: number[]
+ /** True when the deletion will branch instead of truncating in place. */
+ willBranch: boolean
+ /** True when an exact pre-message workspace checkpoint exists. */
+ checkpointFound: boolean
+ checkpointReason?: string
+ workspacePath?: string
+ filesToRevert: DeletePreviewFile[]
+ filesToRemove: DeletePreviewFile[]
+ skipped: DeleteSkippedFile[]
+ warnings: string[]
+}
+
+/** Per-operation delete acknowledgement details. */
+export interface MessageEditDeleteResult {
+ removedTurns: number[]
+ revertedFiles: number
+ removedFiles: number
+ skippedFiles: number
+ workspaceRolledBack: boolean
+ auditId: string
+}
 
 /** Host acknowledgement after the child Agent has been published and queued. */
 export interface MessageEditOperationResult {
  sessionId: string
  queuedTurns: number
+ /** Present for successful delete operations. */
+ delete?: MessageEditDeleteResult
+ /** True when the targeted exchange was already absent from the surface. */
+ alreadyDeleted?: boolean
 }
